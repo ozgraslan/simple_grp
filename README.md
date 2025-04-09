@@ -8,7 +8,7 @@ A simple implementation of Octo-like policy with PyTorch.
 - Evaluate the model in libero simulation.
 - Blockwise causal attention between (goal text, obs image), (obs state), (action).
 - No history.
-- No action chunking. Predicts only one action.
+- Action chunking. Predicts only given number of actions but uses the first predicted action in env eval.
 - T5 used for computing goal text embeddings.
   - Goal text embeddings are precomputed, and T5 is not trained.
   - No projection layer for text embeddings.
