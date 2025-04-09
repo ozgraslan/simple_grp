@@ -6,9 +6,6 @@ Based on https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/simple_
 import os
 import math
 import numpy as np
-from scipy.ndimage import rotate
-from scipy.spatial.transform import Rotation
-
 
 import torch
 from torch import nn
@@ -23,6 +20,7 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig, AutoProcessor, Au
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from libero_utils import quat2axisangle
 
 import wandb
 
@@ -138,11 +136,13 @@ class SimpleGRP(nn.Module):
             num_positions = num_text_tokens + num_image_tokens + num_state_tokens + num_action_tokens,
             dimension = dim,
         ) 
+
+        self.register_buffer("num_action_tokens", torch.tensor(num_action_tokens, dtype=torch.int64))
         self.register_buffer("pos_embedding", pos_embedding)
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
 
         self.state_projection = nn.Linear(state_dim, dim)
-        self.action_token = nn.Embedding(1, dim)
+        self.action_token = nn.Embedding(num_action_tokens, dim)
         self.action_head = nn.Linear(dim, action_dim)
 
     def forward(self, batch):
@@ -151,14 +151,22 @@ class SimpleGRP(nn.Module):
 
         img_tokens = self.to_patch_embedding(batch["image"])
         state_tokens = self.state_projection(batch["state"]).unsqueeze(1)
-        action_tokens = self.action_token(torch.zeros((batch_size, 1), dtype=torch.long, device=device))
+        action_tokens = self.action_token(torch.arange(self.num_action_tokens, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1))
         tokens = torch.cat([batch["text_tokens"], img_tokens, state_tokens, action_tokens], dim=1)
         tokens = tokens + self.pos_embedding
 
         out = self.transformer(tokens, att_mask = batch["att_mask"])
 
-        return self.action_head(out[:,-1,:])
+        return self.action_head(out[:, -self.num_action_tokens:, :])
     
+    @torch.no_grad()
+    def get_action(self, batch):
+        # batch size is expected to be 1
+        # chunk size is self.num_action_tokens
+        # returns the first predicted action in the chunk
+        action_chunk = self(batch)
+        return action_chunk[0,0]
+
 def init_model(transformer_params = {"depth": 6, "heads": 8, "mlp_dim": 2048}, 
                image_params = {"image_shape": (256, 256, 3), "patch_size": 16}, 
                text_token_shape = (0, 0, 0), action_shape = (0, 0), state_shape = (0, 0)):
@@ -232,7 +240,7 @@ def get_task_text_embeds(tasks):
     text_masks = torch.cat(text_mask_list, dim=0)[task_ids]
     return text_embeds, text_masks
 
-def get_eval_env(task_id = 0, image_shape=(256, 256, 3), seed=0):
+def get_eval_env(task_id=0, image_shape=(256, 256, 3), seed=0):
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite_name = "libero_10" # can also choose libero_spatial, libero_object, etc.
     task_suite = benchmark_dict[task_suite_name]()
@@ -267,20 +275,20 @@ def evaluate_on_env(eval_task_init_state, eval_task_text_embeds, eval_task_atten
     # and we need to wait for them to fall
     obs = eval_env.set_init_state(eval_task_init_state)
     for _ in range(10):
-        obs, reward, done, info = eval_env.step([0.0] * 6 + [-1.0])
+        obs, reward, done, info = eval_env.step([0.0] * 6 + [-1.0]) ## dummy action
 
     done, cum_reward, step, frame_list = False, 0, 0, []
     while not done and step < 500:
-        image = rotate(obs["agentview_image"], angle=180)
+        image = obs["agentview_image"][::-1, ::-1].copy()
         frame_list.append(image)
-        state = np.concatenate([obs["robot0_eef_pos"], Rotation.from_quat(obs["robot0_eef_quat"], scalar_first=False).as_rotvec(), obs["robot0_gripper_qpos"]], axis=0)
+        state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
         batch = {"image" : to_tensor(image).unsqueeze(0).to(device), 
                  "state" : torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device),
                  "text_tokens": eval_task_text_embeds.clone(),
                  "att_mask": eval_task_attention_mask.clone()
                 }
-        pred_action =  model(batch)
-        obs, reward, done, info = eval_env.step(pred_action[0].cpu().numpy())
+        pred_action =  model.get_action(batch)
+        obs, reward, done, info = eval_env.step(pred_action.cpu().numpy())
         cum_reward += reward
         step += 1
 
@@ -291,19 +299,19 @@ if __name__ == "__main__":
     repo_id = "lerobot/libero_10_image"
     patch_size = 16
     batch_size = 128
-    training_steps = 100000
-    log_freq = 1000
-    val_log_freq = 2000
-    eval_log_freq = 4000
+    training_steps = 10000
+    log_freq = 100
+    val_log_freq = 200
+    eval_log_freq = 400
     num_state_tokens = 1
-    num_action_tokens = 1
+    num_action_tokens = 8
     transformer_mlp_dim = 2048
     transformer_depth = 6
     transformer_heads = 8
-    use_wandb = False
+    use_wandb = True
     compile = False
     learning_rate = 5e-5
-    model_path = '/network/projects/real-g-grp/simple_grp_full.pt'
+    model_path = '/network/projects/real-g-grp/simple_grp_ac8.pt'
 
     # - Calculate train and val episodes
     dataset_metadata = LeRobotDatasetMetadata(repo_id)
@@ -319,9 +327,18 @@ if __name__ == "__main__":
     print(f"Number of episodes in full dataset: {total_episodes}")
     print(f"Number of episodes in training dataset (90% subset): {len(train_episodes)}")
     print(f"Number of episodes in validation dataset (10% subset): {len(val_episodes)}")
+
+    delta_timestamps = {
+        # # loads 4 images: 1 second before current frame, 500 ms before, 200 ms before, and current frame
+        # camera_key: [-1, -0.5, -0.20, 0],
+        # # loads 6 state vectors: 1.5 seconds before, 1 second before, ... 200 ms, 100 ms, and current frame
+        # "observation.state": [-1.5, -1, -0.5, -0.20, -0.10, 0],
+        # loads 64 action vectors: current frame, 1 frame in the future, 2 frames, ... 63 frames in the future
+        "action": [t / dataset_metadata.fps for t in range(num_action_tokens)],
+    }
     # - Load train an val datasets
-    train_dataset = LeRobotDataset(repo_id, episodes=train_episodes)
-    val_dataset = LeRobotDataset(repo_id, episodes=val_episodes)
+    train_dataset = LeRobotDataset(repo_id, episodes=train_episodes, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]})
+    val_dataset = LeRobotDataset(repo_id, episodes=val_episodes, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]})
     print(f"Number of frames in training dataset (90% subset): {len(train_dataset)}")
     print(f"Number of frames in validation dataset (10% subset): {len(val_dataset)}")
 
