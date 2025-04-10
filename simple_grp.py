@@ -192,27 +192,13 @@ def train_step(batch):
     optimizer.zero_grad()
     pred_action =  model(batch)
     loss = loss_function(pred_action, batch["action"])
+    valid_mask = batch["valid_mask"]
+    loss = loss * valid_mask
+    loss = loss.sum() / valid_mask.sum()
     loss.backward()
     optimizer.step()
     scheduler.step()
     return loss.detach()
-
-
-@torch.no_grad()
-def validate_model():
-    model.eval()
-    loss_cumsum = 0
-    for batch in val_dl:
-        batch = {"image" : batch["observation.images.image"].to(device), 
-                "state" : batch["observation.state"].to(device), 
-                "action": batch["action"].to(device),
-                "text_tokens": text_embeds[batch["task_index"].to(device)],
-                "att_mask": attention_mask[batch["task_index"].to(device)]}
-
-        pred_action =  model(batch)
-        loss = loss_function(pred_action, batch["action"]) 
-        loss_cumsum = loss_cumsum + loss.item()
-    return loss_cumsum / len(val_dl)
 
 @torch.no_grad()
 def encode_txt(s):
@@ -240,78 +226,91 @@ def get_task_text_embeds(tasks):
     text_masks = torch.cat(text_mask_list, dim=0)[task_ids]
     return text_embeds, text_masks
 
-def get_eval_env(task_id=0, image_shape=(256, 256, 3), seed=0):
+def evaluate_model(task_suite_name="libero_10", num_trials=5, img_shape=(256, 256, 3)):
+
     benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite_name = "libero_10" # can also choose libero_spatial, libero_object, etc.
-    task_suite = benchmark_dict[task_suite_name]()
-    task = task_suite.get_task(task_id)
-    task_name = task.name
-    task_description = task.language
-    task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    print(f"[info] retrieving task {task_id} from suite {task_suite_name}, the " + \
-        f"language instruction is {task_description}, and the bddl file is {task_bddl_file}")
+    task_suite = benchmark_dict[task_suite_name]()  
+    for task_id in range(task_suite.n_tasks):
 
-    # step over the environment
-    env_args = {
-        "bddl_file_name": task_bddl_file,
-        "camera_heights": image_shape[0],
-        "camera_widths": image_shape[1]
-    }
+        task = task_suite.get_task(task_id)
+        task_name = task.name
+        task_description = task.language
+        task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+        print(f"[info] retrieving task {task_id} from suite {task_suite_name}, the " + \
+            f"language instruction is {task_description}, and the bddl file is {task_bddl_file}")
 
-    # Get default LIBERO initial states
-    initial_states = task_suite.get_task_init_states(task_id)
-    env = OffScreenRenderEnv(**env_args)
-    env.seed(seed)
-    return env, task_description, initial_states
+        # step over the environment
+        env_args = {
+            "bddl_file_name": task_bddl_file,
+            "camera_heights": img_shape[0],
+            "camera_widths": img_shape[1]
+        }
+
+        # Get default LIBERO initial states
+        env_init_states = task_suite.get_task_init_states(task_id)
+        env = OffScreenRenderEnv(**env_args)
+        env.seed(0)
+
+        task_text_embeds, task_text_masks = encode_txt(task_description)
+        task_text_masks = torch.cat([task_text_masks, torch.ones((task_text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=task_text_masks.dtype)], dim=1)    
+        task_attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).expand(task_text_masks.shape[0], -1), task_text_masks).unsqueeze(1)
+
+        task_text_embeds, task_attention_mask = task_text_embeds.to(device), task_attention_mask.to(device)
+
+        for _ in range(num_trials):
+            rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
+            frames = run_env(env, rd_task_init_state, task_text_embeds, task_attention_mask)
+            # print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
+            if use_wandb:
+                # wandb.log({"eval env return": cum_reward}, step=step*batch_size)
+                wandb.log({"video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), fps=dataset_metadata.fps)})
 
 
 @torch.no_grad()
-def evaluate_on_env(eval_task_init_state, eval_task_text_embeds, eval_task_attention_mask):
+def run_env(env, task_init_state, task_text_embeds, task_attention_mask):
     model.eval()
 
-    eval_env.reset()
+    env.reset()
     ## taken from https://github.com/Physical-Intelligence/openpi/blob/36dc3c037eb8a3921be9ecb94369d60cbf56f58f/examples/libero/main.py
     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
     # and we need to wait for them to fall
-    obs = eval_env.set_init_state(eval_task_init_state)
+    obs = env.set_init_state(task_init_state)
     for _ in range(10):
-        obs, reward, done, info = eval_env.step([0.0] * 6 + [-1.0]) ## dummy action
+        obs, reward, done, info = env.step([0.0] * 6 + [-1.0]) ## dummy action
 
-    done, cum_reward, step, frame_list = False, 0, 0, []
+    done, step, frame_list = False, 0, []
     while not done and step < 500:
         image = obs["agentview_image"][::-1, ::-1].copy()
         frame_list.append(image)
         state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
         batch = {"image" : to_tensor(image).unsqueeze(0).to(device), 
                  "state" : torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device),
-                 "text_tokens": eval_task_text_embeds.clone(),
-                 "att_mask": eval_task_attention_mask.clone()
+                 "text_tokens": task_text_embeds.clone(),
+                 "att_mask": task_attention_mask.clone()
                 }
         pred_action =  model.get_action(batch)
-        obs, reward, done, info = eval_env.step(pred_action.cpu().numpy())
-        cum_reward += reward
+        obs, reward, done, info = env.step(pred_action.cpu().numpy())
         step += 1
 
-    return cum_reward, np.stack(frame_list, axis=0)
+    env.close()
+    return np.stack(frame_list, axis=0)
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     repo_id = "lerobot/libero_10_image"
     patch_size = 16
     batch_size = 128
-    training_steps = 10000
+    training_steps = 500
     log_freq = 100
-    val_log_freq = 200
-    eval_log_freq = 400
     num_state_tokens = 1
-    num_action_tokens = 8
+    num_action_tokens = 32
     transformer_mlp_dim = 2048
     transformer_depth = 6
     transformer_heads = 8
     use_wandb = True
-    compile = False
-    learning_rate = 5e-5
-    model_path = '/network/projects/real-g-grp/simple_grp_ac8.pt'
+    torch_compile = True
+    learning_rate = 3e-4
+    model_path = '/network/projects/real-g-grp/simple_grp_full_ac32.pt'
 
     # - Calculate train and val episodes
     dataset_metadata = LeRobotDatasetMetadata(repo_id)
@@ -320,13 +319,7 @@ if __name__ == "__main__":
     print(f"Dataset features: {ds_features}")
 
     total_episodes = dataset_metadata.total_episodes
-    episodes = list(range(dataset_metadata.total_episodes))
-    num_train_episodes = math.floor(total_episodes * 95 / 100)
-    train_episodes = episodes[:num_train_episodes]
-    val_episodes = episodes[num_train_episodes:]
     print(f"Number of episodes in full dataset: {total_episodes}")
-    print(f"Number of episodes in training dataset (90% subset): {len(train_episodes)}")
-    print(f"Number of episodes in validation dataset (10% subset): {len(val_episodes)}")
 
     delta_timestamps = {
         # # loads 4 images: 1 second before current frame, 500 ms before, 200 ms before, and current frame
@@ -337,10 +330,8 @@ if __name__ == "__main__":
         "action": [t / dataset_metadata.fps for t in range(num_action_tokens)],
     }
     # - Load train an val datasets
-    train_dataset = LeRobotDataset(repo_id, episodes=train_episodes, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]})
-    val_dataset = LeRobotDataset(repo_id, episodes=val_episodes, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]})
-    print(f"Number of frames in training dataset (90% subset): {len(train_dataset)}")
-    print(f"Number of frames in validation dataset (10% subset): {len(val_dataset)}")
+    train_dataset = LeRobotDataset(repo_id, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]}) # episodes=train_episodes, 
+    print(f"Number of frames in training dataset (100% subset): {len(train_dataset)}")
 
 
     train_dl = DataLoader(train_dataset,
@@ -351,14 +342,6 @@ if __name__ == "__main__":
                           drop_last=True,
                          )
     
-    val_dl = DataLoader(val_dataset,
-                        batch_size=batch_size,
-                        shuffle=False,
-                        num_workers=0,
-                        pin_memory=device!="cpu",
-                        drop_last=True,
-                       ) # makes avg comp easier
-
     t5_tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
     t5_model = AutoModel.from_pretrained("google-t5/t5-small")
        
@@ -393,22 +376,14 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=training_steps)
 
-    loss_function = torch.nn.SmoothL1Loss()
+    loss_function = torch.nn.SmoothL1Loss(reduction="none")
 
-    if compile:
+    if torch_compile:
         model = torch.compile(model)
-
-    eval_env, eval_task_text, eval_env_init_states = get_eval_env(task_id=0, image_shape=ds_features["observation.images.image"]["shape"], seed=0)
-    eval_task_text_embeds, eval_task_text_masks = encode_txt(eval_task_text)
-    eval_task_text_masks = torch.cat([eval_task_text_masks, torch.ones((eval_task_text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=eval_task_text_masks.dtype)], dim=1)
-    
-    eval_task_attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).expand(eval_task_text_masks.shape[0], -1), eval_task_text_masks).unsqueeze(1)
-
-    eval_task_text_embeds, eval_task_attention_mask = eval_task_text_embeds.to(device), eval_task_attention_mask.to(device)
 
     config = {**model_params, "batch_size": batch_size, "training_steps": training_steps,  "lr": learning_rate,
               "loss_function": type(loss_function).__name__, "optimizer": type(optimizer).__name__,
-              "log_freq": log_freq, "val_log_freq": val_log_freq}
+              "log_freq": log_freq}
     
     # start a new wandb run to track this script
     if use_wandb:
@@ -418,6 +393,7 @@ if __name__ == "__main__":
             config = config
         )
         wandb.run.log_code(".")
+
     step = 0
     done = False
     while not done:
@@ -425,6 +401,7 @@ if __name__ == "__main__":
             batch = {"image" : batch["observation.images.image"].to(device), 
                         "state": batch["observation.state"].to(device),
                         "action": batch["action"].to(device),
+                        "valid_mask": (~batch["action_is_pad"]).float().unsqueeze(-1).to(device),
                         "text_tokens": text_embeds[batch["task_index"].to(device)],
                         "att_mask": attention_mask[batch["task_index"].to(device)]}
 
@@ -433,26 +410,11 @@ if __name__ == "__main__":
                 current_lr = optimizer.param_groups[0]['lr']
                 if use_wandb:
                     wandb.log({"train loss": loss, "learning rate": current_lr}, step=step*batch_size)
-                print("train loss:", loss.item(), "current learning rate:", current_lr, 
-                      "step:", step, "batch*step:", step*batch_size)
-
-            if step % val_log_freq == 0:
-                avg_val_loss = validate_model()
-                if use_wandb:
-                    wandb.log({"avg val loss": avg_val_loss}, step=step*batch_size)
-                print("avg val loss:", avg_val_loss, "step:", step, "batch*step:", step*batch_size)
             
-            if step % eval_log_freq == 0:
-                rd_eval_task_init_state = eval_env_init_states[np.random.randint(0, len(eval_env_init_states))]
-                cum_reward, frames = evaluate_on_env(rd_eval_task_init_state, eval_task_text_embeds, eval_task_attention_mask)
-                print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
-                if use_wandb:
-                    wandb.log({"eval env return": cum_reward}, step=step*batch_size)
-                    wandb.log({"video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), fps=dataset_metadata.fps)})
-                
-
             step += 1
             if step >= training_steps:
                 done = True
                 break
-    torch.save(model.state_dict(), model_path)
+
+    evaluate_model(img_shape=img_shape)
+    # torch.save(model.state_dict(), model_path)
