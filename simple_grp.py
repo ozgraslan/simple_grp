@@ -265,6 +265,7 @@ def evaluate_model(task_suite_name="libero_10", num_trials=5, img_shape=(256, 25
                 # wandb.log({"eval env return": cum_reward}, step=step*batch_size)
                 wandb.log({"video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), fps=dataset_metadata.fps)})
 
+        env.close() 
 
 @torch.no_grad()
 def run_env(env, task_init_state, task_text_embeds, task_attention_mask):
@@ -292,7 +293,6 @@ def run_env(env, task_init_state, task_text_embeds, task_attention_mask):
         obs, reward, done, info = env.step(pred_action.cpu().numpy())
         step += 1
 
-    env.close()
     return np.stack(frame_list, axis=0)
 
 if __name__ == "__main__":
@@ -300,7 +300,7 @@ if __name__ == "__main__":
     repo_id = "lerobot/libero_10_image"
     patch_size = 16
     batch_size = 128
-    training_steps = 500
+    training_steps = 100000
     log_freq = 100
     num_state_tokens = 1
     num_action_tokens = 32
@@ -417,4 +417,4 @@ if __name__ == "__main__":
                 break
 
     evaluate_model(img_shape=img_shape)
-    # torch.save(model.state_dict(), model_path)
+    torch.save(model.state_dict(), model_path)
