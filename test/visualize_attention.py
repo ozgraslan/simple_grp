@@ -35,7 +35,7 @@ from torchvision import transforms as pth_transforms
 import numpy as np
 from PIL import Image
 
-from transformers import AutoConfig, AutoProcessor, AutoBackbone
+from transformers import AutoConfig, AutoProcessor, AutoBackbone, AutoTokenizer, AutoModel
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 
@@ -112,7 +112,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('Visualize Self-Attention maps')
     parser.add_argument('--arch', default='base', type=str,
         choices=['small', 'base', 'large', "giant"], help='Architecture (support only ViT atm).')
-    parser.add_argument("--image_path", default=None, type=str, help="Path of the image to load.")
     parser.add_argument('--output_dir', default='.', help='Path where to save visualizations.')
     parser.add_argument("--threshold", type=float, default=None, help="""We visualize masks
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
@@ -120,16 +119,60 @@ if __name__ == '__main__':
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # build model
-    vis_config = AutoConfig.from_pretrained("facebook/dinov2-with-registers-giant")
-    vis_backbone = AutoBackbone.from_pretrained("facebook/dinov2-with-registers-giant", out_features=[]).to(device)
-    vis_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-giant", out_features=[])
+    t5_tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small", torch_dtype=torch.bfloat16)
+    t5_model = AutoModel.from_pretrained("google-t5/t5-small", torch_dtype=torch.bfloat16)
+
+    vis_config = AutoConfig.from_pretrained(f"facebook/dinov2-with-registers-{args.arch}", out_features=[], torch_dtype=torch.bfloat16)
+    vis_backbone = AutoBackbone.from_pretrained(f"facebook/dinov2-with-registers-{args.arch}", out_features=[], torch_dtype=torch.bfloat16).to(device)
+    vis_processor = AutoProcessor.from_pretrained(f"facebook/dinov2-with-registers-{args.arch}", out_features=[], torch_dtype=torch.bfloat16)
     for p in vis_backbone.parameters():
         p.requires_grad = False
     vis_backbone.eval()
     vis_backbone.to(device)
 
+    from simple_grp_tsd import init_model, get_task_text_embeds, get_att_mask
+    from dataset import encode_img
+    dataset_metadata = LeRobotDatasetMetadata("lerobot/libero_10_image")
+    ds_features = dataset_metadata.features
 
-    train_dataset = LeRobotDataset("lerobot/libero_10_image", episodes=[0]) # episodes=train_episodes, 
+    num_state_tokens = 1
+    num_action_tokens = 32
+    transformer_mlp_dim = 2048
+    transformer_depth = 6
+    transformer_heads = nh = 8
+    num_img_tokens, image_dim = ((vis_processor.crop_size["height"] // vis_config.patch_size)**2, vis_config.hidden_size)
+    text_embeds, text_masks = get_task_text_embeds(dataset_metadata.tasks, t5_tokenizer, t5_model)
+    num_text_tokens = text_embeds.shape[1]
+    text_embeds = text_embeds.to(device)
+    text_masks = torch.cat([text_masks, torch.ones((text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=text_masks.dtype)], dim=1)
+    block_mask_arr = torch.tensor([1] + (num_text_tokens + num_img_tokens  - 1) * [0] \
+                                + [1] + (num_state_tokens - 1) * [0] \
+                                + [1] + (num_action_tokens - 1) * [0])
+
+    attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(text_masks.shape[0], 1), text_masks)
+    # print(attention_mask.shape, attention_mask[0, num_img_tokens + num_text_tokens + num_state_tokens, num_text_tokens:num_text_tokens+num_img_tokens])
+    # exit(0)
+    attention_mask = torch.logical_not(attention_mask)    
+    attention_mask = attention_mask.unsqueeze(1).repeat(1, transformer_heads, 1, 1).to(device)
+    num_tokens = attention_mask.shape[-1]
+
+
+    model_params = dict(transformer_params = {"depth": transformer_depth, 
+                                            "heads": transformer_heads, 
+                                            "mlp_dim": transformer_mlp_dim}, 
+                    image_params =  {"image_dim": image_dim, "num_image_tokens": num_img_tokens}, 
+                    text_token_shape = tuple(text_embeds.shape),
+                    state_shape = (num_state_tokens, ds_features["observation.state"]["shape"][0]), 
+                    action_shape = (num_action_tokens, ds_features["action"]["shape"][0]))
+
+
+
+    model = init_model(**model_params).to(device=device, dtype=torch.bfloat16)
+    model.load_state_dict(torch.load("/network/projects/real-g-grp/simple_grp/simple_grp_dino_base_patches4_final.pt"))
+
+
+
+    train_dataset = LeRobotDataset("lerobot/libero_10_image", episodes=[1]) # episodes=train_episodes, 
     print(f"Number of frames in training dataset (100% subset): {len(train_dataset)}")
 
 
@@ -142,29 +185,35 @@ if __name__ == '__main__':
                          )
 
     patch_size = vis_config.patch_size
-    num_registers = vis_config.num_register_tokens 
-    print(num_registers)
 
-    save_list = [ [[] for _ in range(vis_config.num_attention_heads)] for _ in range(num_registers+2)]
+    save_list = [ [[] for _ in range(vis_config.num_attention_heads)] for _ in range(num_action_tokens)]
+    save_list.append([])
     print(save_list, len(save_list))
     for data in train_dl:
         img = tensor_to_numpy(data["observation.images.image"][0])
         img = vis_processor(img, return_tensors="pt")
-        w_featmap = img.pixel_values.shape[-2] // patch_size
-        h_featmap = img.pixel_values.shape[-1] // patch_size
+        w_featmap = vis_processor.crop_size["width"] // vis_config.patch_size
+        h_featmap = vis_processor.crop_size["height"] // vis_config.patch_size
 
-        output = vis_backbone(**img.to(device), output_attentions=True, output_hidden_states=True, return_dict=True)
+        # output = vis_backbone(**img.to(device), output_attentions=True, output_hidden_states=True, return_dict=True)
+        batch = {"image" : encode_img(data["observation.images.image"], vis_config, vis_processor, vis_backbone), 
+                 "state": data["observation.state"].to(device, dtype=torch.bfloat16),
+                 "text_tokens": text_embeds[data["task_index"].to(device)],
+                 "att_mask": attention_mask[data["task_index"].to(device)].reshape(-1, num_tokens, num_tokens)}
 
-        nh = vis_config.num_attention_heads # number of head
-            # save attentions heatmaps
+        with torch.no_grad():
+            out, att_map = model(batch, return_att=True)
+        # print(att_map[-1].shape)
+        # save attentions heatmaps
         os.makedirs(args.output_dir, exist_ok=True)
         save_list[-1].append(tensor_to_numpy(torchvision.utils.make_grid(img.pixel_values, normalize=True, scale_each=True)))
 
+        # print(num_img_tokens, num_text_tokens, num_state_tokens)
         # we keep only the output patch attention
-        for reg_idx in range(0, num_registers+1):
-            attentions = output.attentions[-1].clone()
+        for reg_idx in range(0, num_action_tokens):
+            attentions = att_map[-1].clone()
 
-            attentions = attentions[0, :, reg_idx, 1+num_registers:].reshape(nh, -1)
+            attentions = attentions[0, :, num_img_tokens + num_text_tokens + num_state_tokens + reg_idx, num_text_tokens:num_text_tokens +num_img_tokens].reshape(nh, -1)
 
             if args.threshold is not None:
                 # we keep only a certain percentage of the mass
@@ -180,7 +229,7 @@ if __name__ == '__main__':
                 th_attn = nn.functional.interpolate(th_attn.unsqueeze(0), scale_factor=patch_size, mode="nearest")[0].cpu().numpy()
 
             attentions = attentions.reshape(nh, w_featmap, h_featmap)
-            attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=patch_size, mode="nearest")[0].cpu().numpy()
+            attentions = nn.functional.interpolate(attentions.unsqueeze(0).to(torch.float32), scale_factor=patch_size, mode="nearest")[0].cpu().numpy()
     
             for j in range(nh):
                 save_list[reg_idx][j].append(tensor_to_numpy2(attentions[j]))
@@ -208,11 +257,14 @@ if __name__ == '__main__':
                 for j in range(nh):
                     display_instances(image, th_attn[j], fname=os.path.join(args.output_dir, "reg" + str(reg_idx) + "_mask_th" + str(args.threshold) + "_head" + str(j) +".png"), blur=False)
 
-    for idx in range(0, num_registers+2):
-        if idx == 5:
+    for idx in range(0, num_action_tokens+1):
+        if idx == num_action_tokens:
             fname = os.path.join(args.output_dir, "trajectory.gif")
+            imageio.mimsave(fname, save_list[idx])
+
             break
 
-        for j in range(vis_config.num_attention_heads):
-            fname = os.path.join(args.output_dir, "reg" + str(idx) + "_attn-head" + str(j) + ".gif")
+        for j in range(nh):
+            fname = os.path.join(args.output_dir, "action_token" + str(idx) + "_attn-head" + str(j) + ".gif")
+            print(save_list[idx][j], idx)
             imageio.mimsave(fname, save_list[idx][j])

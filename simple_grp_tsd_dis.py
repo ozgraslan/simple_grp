@@ -12,6 +12,7 @@ import torch
 from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader
+from einops.layers.torch import Rearrange
 
 import transformers
 from transformers import AutoTokenizer, AutoModel, AutoConfig, AutoProcessor, AutoBackbone
@@ -22,6 +23,27 @@ from libero_utils import quat2axisangle
 
 import wandb
 from tensordict import TensorDict
+
+def discretize_action(action, low=-1.0, high=1.0, bins=256):
+    action_clipped = action.clamp(low, high - 1e-6)  # prevent upper-edge spill
+    bin_width = (high - low) / bins
+    return torch.floor((action_clipped - low) / bin_width).long()
+
+def undiscretize_action(indices, low=-1.0, high=1.0, bins=256, gripper_index=6):
+    bin_width = (high - low) / bins
+    cont = low + (indices.float() + 0.5) * bin_width
+    cont[..., gripper_index] = torch.where(
+        indices[..., gripper_index] < bins // 2,
+        torch.tensor(-1.0, device=indices.device),
+        torch.tensor(1.0, device=indices.device)
+    )
+    return cont
+
+def unnormalize(value, q01, q99):
+    return (value+1) * 0.5 * (q99 - q01) + q01
+
+def normalize(value, q01, q99):
+    return torch.clamp(2 * (value - q01) / (q99 - q01 + 1e-8) - 1, -1, 1)
 
 # helpers
 
@@ -57,7 +79,7 @@ def get_att_mask(mask_arr, inp_mask):
     return torch.logical_or(torch.logical_and(attn_mask, valid_mask),  
                             torch.eye(valid_mask.shape[1], device=mask_arr.device).unsqueeze(0))
 
-
+    
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
@@ -115,7 +137,7 @@ class Transformer(nn.Module):
 
 class SimpleGRP(nn.Module):
     def __init__(self, *, state_dim, action_dim, dim, depth, heads, mlp_dim, image_dim = 0, num_image_tokens=0, 
-                 dim_head = 64, num_text_tokens = 0, num_state_tokens=0, num_action_tokens = 0):
+                 dim_head = 64, num_text_tokens = 0, num_state_tokens=0, num_action_tokens = 0, num_action_bins=1):
         super().__init__()
 
 
@@ -136,7 +158,8 @@ class SimpleGRP(nn.Module):
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
             nn.GELU(),
-            nn.Linear(dim, action_dim),
+            nn.Linear(dim, action_dim*num_action_bins),
+            Rearrange("b n (ab ad) -> b ab n ad", ab = num_action_bins, ad = action_dim),
         )
 
     def forward(self, batch, return_att=False):
@@ -158,12 +181,19 @@ class SimpleGRP(nn.Module):
         # batch size is expected to be 1
         # chunk size is self.num_action_tokens
         # returns the first predicted action in the chunk
-        action_chunk, _ = self(batch).float()
-        return action_chunk[0,0]
+        logit_actions, _ = self(batch) # B, bins, chunk, dim
+        discrete_actions = torch.argmax(logit_actions, dim=1) # B, chunk, dim
+        print(discrete_actions)
+        cont_actions = unnormalize(undiscretize_action(discrete_actions), 
+                                   action_q01, 
+                                   action_q99)
+        # print(cont_actions)
+        print(logit_actions.shape, cont_actions.shape)
+        return cont_actions[0,0]
     
 def init_model(transformer_params = {"depth": 6, "heads": 8, "mlp_dim": 2048}, 
                image_params = {"image_shape": (256, 256, 3), "patch_size": 16}, 
-               text_token_shape = (0, 0, 0), action_shape = (0, 0), state_shape = (0, 0)):
+               text_token_shape = (0, 0, 0), action_shape = (0, 0, 0), state_shape = (0, 0)):
     
     model = SimpleGRP(
         state_dim = state_shape[1],
@@ -177,6 +207,7 @@ def init_model(transformer_params = {"depth": 6, "heads": 8, "mlp_dim": 2048},
         num_text_tokens=text_token_shape[1],
         num_state_tokens=state_shape[0],
         num_action_tokens=action_shape[0],
+        num_action_bins=action_shape[2],
     )
     return model
 
@@ -184,6 +215,9 @@ def train_step(batch):
     model.train()
     optimizer.zero_grad()
     pred_action, _ =  model(batch)
+    print(torch.argmax(pred_action, dim=1)[0,0])
+    print(batch["action"][0,0])
+    print("---------------------")
     loss = loss_function(pred_action, batch["action"])
     valid_mask = batch["valid_mask"]
     loss = loss * valid_mask
@@ -269,7 +303,6 @@ def evaluate_model(task_suite_name="libero_10", num_trials=5, img_shape=(256, 25
                            "video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), 
                                                 caption=task_description, 
                                                 fps=dataset_metadata.fps)})
-
         env.close() 
 
 @torch.no_grad()
@@ -290,7 +323,9 @@ def run_env(env, task_init_state, task_text_embeds, task_attention_mask):
         frame_list.append(image)
         state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
         batch = {"image" : encode_img(image, vis_config, vis_processor, vis_backbone), 
-                 "state" : torch.tensor(state).unsqueeze(0).to(device, dtype=dtype),
+                 "state" : normalize(torch.tensor(state, dtype=torch.float32, device=device), 
+                                     state_q01, 
+                                     state_q99).unsqueeze(0).to(dtype=dtype),
                  "text_tokens": task_text_embeds.clone(),
                  "att_mask": task_attention_mask.clone().reshape(-1, num_tokens, num_tokens)
                 }
@@ -322,8 +357,9 @@ if __name__ == "__main__":
     use_wandb = False
     torch_compile = False
     learning_rate = 3e-4
-    do_eval_on_env = True
-    model_path = "/network/projects/real-g-grp/simple_grp/simple_grp_dino_base_patches4_final.pt"
+    do_eval_on_env = False
+    model_path = "/network/projects/real-g-grp/simple_grp/simple_grp_dino_base_patches_dis_47520.pt"
+    num_action_bins = 256
 
     # - Calculate train and val episodes
     dataset_metadata = LeRobotDatasetMetadata(repo_id)
@@ -331,8 +367,15 @@ if __name__ == "__main__":
     print(f"Dataset metadata: {dataset_metadata}")
     print(f"Dataset features: {ds_features}")
 
+    td_metadata = TensorDict.load_memmap("/network/projects/real-g-grp/libero_td/libero10_metadata.pt").to(device)
+
+    action_q01 = td_metadata["action"]["Q01"].unsqueeze(0).unsqueeze(0)
+    action_q99 = td_metadata["action"]["Q99"].unsqueeze(0).unsqueeze(0)
+    state_q01 = td_metadata["state"]["Q01"]
+    state_q99 = td_metadata["state"]["Q99"]
+
     if not do_eval_on_env:
-        train_dataset = TensorDict.load_memmap("/network/projects/real-g-grp/libero_td/libero10_dinov2_base_patch_cont.pt").to(device)
+        train_dataset = TensorDict.load_memmap("/network/projects/real-g-grp/libero_td/libero10_dinov2_base_reg_norm_discrete.pt").to(device)
         print(train_dataset.batch_size[0])
         save_log_freq = (train_dataset.batch_size[0] // batch_size) * 10
         training_steps = (train_dataset.batch_size[0] // batch_size) * training_epochs
@@ -380,7 +423,7 @@ if __name__ == "__main__":
                         image_params =  {"image_dim": image_dim, "num_image_tokens": num_img_tokens}, 
                         text_token_shape = tuple(text_embeds.shape),
                         state_shape = (num_state_tokens, ds_features["observation.state"]["shape"][0]), 
-                        action_shape = (num_action_tokens, ds_features["action"]["shape"][0]))
+                        action_shape = (num_action_tokens, ds_features["action"]["shape"][0], num_action_bins))
     
 
 
@@ -396,7 +439,7 @@ if __name__ == "__main__":
     else:
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=training_steps)
-        loss_function = torch.nn.SmoothL1Loss(reduction="none")
+        loss_function = nn.CrossEntropyLoss(reduction="none")
 
     if torch_compile:
         model = torch.compile(model)
@@ -441,12 +484,12 @@ if __name__ == "__main__":
                         wandb.log({"train loss": loss, "learning rate": current_lr}, step=step*batch_size)
 
                 if step % save_log_freq == 0:
-                    torch.save(model.state_dict(), model_path + str(step) + ".pt")
+                    # torch.save(model.state_dict(), model_path + str(step) + ".pt")
                     print("Model saved to", model_path + str(step) + ".pt")
                 step += 1
                 if step >= training_steps:
                     done = True
                     break
 
-        torch.save(model.state_dict(), model_path + "final.pt")
+        # torch.save(model.state_dict(), model_path + "final.pt")
     

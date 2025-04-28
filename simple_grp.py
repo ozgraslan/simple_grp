@@ -24,6 +24,8 @@ from libero_utils import quat2axisangle
 
 import wandb
 
+from ctrlo.inference import CTRLOFeatureExtractor
+
 # helpers
 
 def pair(t):
@@ -144,7 +146,12 @@ class SimpleGRP(nn.Module):
 
         self.state_projection = nn.Linear(state_dim, dim)
         self.action_token = nn.Embedding(num_action_tokens, dim)
-        self.action_head = nn.Linear(dim, action_dim)
+        self.action_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, action_dim),
+        )
 
     def forward(self, batch, return_att=False):
         batch_size = batch["image"].shape[0]
@@ -202,13 +209,6 @@ def train_step(batch):
     return loss.detach()
 
 @torch.no_grad()
-def encode_img(img):
-    processed = vis_processor(images=img, return_tensors="pt").to(vis_backbone.device)
-    img_embeds = vis_backbone(**processed, output_hidden_states=True, return_dict=True).hidden_states[-1]
-    torch.cuda.empty_cache()  # Clears cache # without this model leads to reserving too much memory and crashing in the next iter
-    return img_embeds[:, :vis_config.num_register_tokens+1]
-
-@torch.no_grad()
 def encode_txt(s):
     tokenized = t5_tokenizer(s, return_tensors="pt", padding="max_length", max_length=32)
     text_embeds = t5_model.encoder(input_ids=tokenized.input_ids).last_hidden_state
@@ -260,18 +260,23 @@ def evaluate_model(task_suite_name="libero_10", num_trials=5, img_shape=(256, 25
         env.seed(0)
 
         task_text_embeds, task_text_masks = encode_txt(task_description)
+
         task_text_masks = torch.cat([task_text_masks, torch.ones((task_text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=task_text_masks.dtype)], dim=1)    
-        task_attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).expand(task_text_masks.shape[0], -1), task_text_masks).unsqueeze(1)
+        task_attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(task_text_masks.shape[0], 1), task_text_masks)
+        task_attention_mask = torch.logical_not(task_attention_mask)
+        task_attention_mask = task_attention_mask.unsqueeze(1).repeat(1, transformer_heads, 1, 1)
 
         task_text_embeds, task_attention_mask = task_text_embeds.to(device), task_attention_mask.to(device)
 
         for _ in range(num_trials):
             rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
-            frames = run_env(env, rd_task_init_state, task_text_embeds, task_attention_mask)
+            frames, cum_reward = run_env(env, rd_task_init_state, task_text_embeds, task_attention_mask)
             # print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
             if use_wandb:
-                # wandb.log({"eval env return": cum_reward}, step=step*batch_size)
-                wandb.log({"video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), fps=dataset_metadata.fps)})
+                wandb.log({"eval env return": cum_reward, 
+                           "video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), 
+                                                caption=task_description, 
+                                                fps=dataset_metadata.fps)})
 
         env.close() 
 
@@ -287,8 +292,8 @@ def run_env(env, task_init_state, task_text_embeds, task_attention_mask):
     for _ in range(10):
         obs, reward, done, info = env.step([0.0] * 6 + [-1.0]) ## dummy action
 
-    done, step, frame_list = False, 0, []
-    while not done and step < 500:
+    done, step, frame_list, cum_reward = False, 0, [], 0
+    while not done and step < 750:
         image = obs["agentview_image"][::-1, ::-1].copy()
         frame_list.append(image)
         state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
@@ -299,9 +304,10 @@ def run_env(env, task_init_state, task_text_embeds, task_attention_mask):
                 }
         pred_action =  model.get_action(batch)
         obs, reward, done, info = env.step(pred_action.cpu().numpy())
+        cum_reward += reward
         step += 1
 
-    return np.stack(frame_list, axis=0)
+    return np.stack(frame_list, axis=0), cum_reward
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -309,7 +315,10 @@ if __name__ == "__main__":
     patch_size = 16
     batch_size = 128
     training_steps = 0
+    training_epochs = 100
+
     log_freq = 100
+    save_log_freq = 10000
     num_state_tokens = 1
     num_action_tokens = 32
     transformer_mlp_dim = 2048
@@ -318,32 +327,40 @@ if __name__ == "__main__":
     use_wandb = False
     torch_compile = False
     learning_rate = 3e-4
-    model_path = '/network/projects/real-g-grp/simple_grp_full_ac32.pt'
+    do_eval_on_env = False
+    model_path = '/network/projects/real-g-grp/simple_grp_ctrlo'
 
     # - Calculate train and val episodes
     dataset_metadata = LeRobotDatasetMetadata(repo_id)
     ds_features = dataset_metadata.features
     print(f"Dataset metadata: {dataset_metadata}")
     print(f"Dataset features: {ds_features}")
+    print(dataset_metadata.tasks)
 
-    total_episodes = dataset_metadata.total_episodes
-    print(f"Number of episodes in full dataset: {total_episodes}")
+    if not do_eval_on_env:
+        total_episodes = dataset_metadata.total_episodes
+        print(f"Number of episodes in full dataset: {total_episodes}")
 
-    # - Load train an val datasets
-    train_dataset = LeRobotDataset(repo_id, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]}) # episodes=train_episodes, 
-    print(f"Number of frames in training dataset (100% subset): {len(train_dataset)}")
+        # - Load train an val datasets
+        train_dataset = LeRobotDataset(repo_id, delta_timestamps={"action": [t / dataset_metadata.fps for t in range(num_action_tokens)]}) # episodes=train_episodes, 
+        print(f"Number of frames in training dataset (100% subset): {len(train_dataset)}")
+        save_log_freq = (len(train_dataset)// batch_size) * 10
+        training_steps = (len(train_dataset) // batch_size) * training_epochs
+        print(save_log_freq, training_steps)
 
 
-    train_dl = DataLoader(train_dataset,
-                          batch_size=batch_size,
-                          shuffle=True,
-                          num_workers=0,
-                          pin_memory=device!="cpu",
-                          drop_last=True,
-                         )
-    
+        train_dl = DataLoader(train_dataset,
+                            batch_size=batch_size,
+                            shuffle=True,
+                            num_workers=0,
+                            pin_memory=device!="cpu",
+                            drop_last=True,
+                            )
+        
     t5_tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
     t5_model = AutoModel.from_pretrained("google-t5/t5-small")
+
+
        
     text_embeds, text_masks = get_task_text_embeds(dataset_metadata.tasks)
     num_text_tokens = text_embeds.shape[1]
@@ -352,12 +369,16 @@ if __name__ == "__main__":
     ## precompute blockwise attention mask
     img_shape = ds_features["observation.images.image"]["shape"]
     num_img_tokens = (img_shape[0] // patch_size) * (img_shape[1] // patch_size)
+    
     text_masks = torch.cat([text_masks, torch.ones((text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=text_masks.dtype)], dim=1)
     block_mask_arr = torch.tensor([1] + (num_text_tokens + num_img_tokens  - 1) * [0] \
                                 + [1] + (num_state_tokens - 1) * [0] \
                                 + [1] + (num_action_tokens - 1) * [0])
 
-    attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).expand(text_masks.shape[0], -1), text_masks).unsqueeze(1)
+    attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(text_masks.shape[0], 1), text_masks)
+    attention_mask = torch.logical_not(attention_mask)
+    attention_mask = attention_mask.unsqueeze(1).repeat(1, transformer_heads, 1, 1)
+    num_tokens = attention_mask.shape[-1]
 
     attention_mask = attention_mask.to(device)
 
@@ -373,10 +394,14 @@ if __name__ == "__main__":
 
 
     model = init_model(**model_params).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=training_steps)
-
-    loss_function = torch.nn.SmoothL1Loss(reduction="none")
+    if do_eval_on_env:
+        model.load_state_dict(torch.load(model_path))
+        optimizer = None
+        loss_function = None
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=training_steps)
+        loss_function = torch.nn.SmoothL1Loss(reduction="none")
 
     if torch_compile:
         model = torch.compile(model)
@@ -394,27 +419,32 @@ if __name__ == "__main__":
         )
         wandb.run.log_code(".")
 
-    step = 0
-    done = False
-    while not done:
-        for batch in train_dl:
-            batch = {"image" : batch["observation.images.image"].to(device), 
+    if do_eval_on_env:
+        evaluate_model(img_shape=img_shape)
+    else:
+        step = 0
+        done = False
+        while not done:
+            for batch in train_dl:
+                batch = {"image" : batch["observation.images.image"].to(device), 
                         "state": batch["observation.state"].to(device),
                         "action": batch["action"].to(device),
                         "valid_mask": (~batch["action_is_pad"]).float().unsqueeze(-1).to(device),
                         "text_tokens": text_embeds[batch["task_index"].to(device)],
-                        "att_mask": attention_mask[batch["task_index"].to(device)]}
+                        "att_mask": attention_mask[batch["task_index"].to(device)].reshape(-1, num_tokens, num_tokens)}
 
-            loss = train_step(batch)
-            if step % log_freq == 0:
-                current_lr = optimizer.param_groups[0]['lr']
-                if use_wandb:
-                    wandb.log({"train loss": loss, "learning rate": current_lr}, step=step*batch_size)
-            
-            step += 1
-            if step >= training_steps:
-                done = True
-                break
+                loss = train_step(batch)
+                if step % log_freq == 0:
+                    current_lr = optimizer.param_groups[0]['lr']
+                    if use_wandb:
+                        wandb.log({"train loss": loss, "learning rate": current_lr}, step=step*batch_size)
+                
+                if step % save_log_freq == 0:
+                    torch.save(model.state_dict(), model_path + str(step) + ".pt")
+                    print("Model saved to", model_path + str(step) + ".pt")
+                step += 1
+                if step >= training_steps:
+                    done = True
+                    break
 
-    evaluate_model(img_shape=img_shape)
-    torch.save(model.state_dict(), model_path)
+        torch.save(model.state_dict(), model_path + "final.pt")
