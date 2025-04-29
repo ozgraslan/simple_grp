@@ -318,7 +318,7 @@ def run_env(env, task_init_state, num_env_steps, num_ol_actions,
 
     done, step, frame_list, cum_reward = False, 0, [], 0
     action_queue = []
-    while not done and step < 500:
+    while not done and step < num_env_steps:
         image = obs["agentview_image"][::-1, ::-1].copy()
         # print(image.shape)
         frame_list.append(image)
@@ -367,9 +367,15 @@ if __name__ == "__main__":
     use_wandb = True
     torch_compile = False
     learning_rate = 3e-4
-    do_eval_on_env = True
+    do_eval_on_env = False
+
     img_only_ctrlo = True
-    model_path = "/network/projects/real-g-grp/simple_grp/ctrlo_img_cc_grpfinal.pt"
+    model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_img_224_grp_"
+    dataset_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_img_224_dataset_792.pt"
+
+    # img_only_ctrlo = False
+    # model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_full_224_grp_"
+    # dataset_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_full_224_dataset_792.pt"
 
     # - Calculate train and val episodes
 
@@ -395,7 +401,7 @@ if __name__ == "__main__":
         print(f"Dataset metadata: {dataset_metadata}")
         print(f"Dataset features: {ds_features}")
 
-        train_dataset = TensorDict.load_memmap("/network/projects/real-g-grp/libero_td/libero10_ctrlo_img_cc_dataset_792.pt") #.to(device, dtype=dtype)
+        train_dataset = TensorDict.load_memmap(dataset_path) #.to(device, dtype=dtype)
         print_memory_usage()
         train_dataset = train_dataset.to(dtype=dtype).to(device)
         torch.cuda.empty_cache()

@@ -89,9 +89,9 @@ if __name__ == "__main__":
     from task2obj import task2obj
     ctrlo = CTRLOFeatureExtractor().to(device)
     ctrlo.eval()
-    save_path = "/network/projects/real-g-grp/libero_td/libero10_ctrlo_img_224_dataset"
-    img_only = True
-
+    save_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_full_224_dataset"
+    img_only = False
+    print(f"Image only: {img_only} {save_path}")
     if not img_only:
         text_embeds, text_masks = get_obj_text_embeds(tasks, task2obj)
         text_embeds, text_masks = text_embeds.to(device), text_masks.to(device)
