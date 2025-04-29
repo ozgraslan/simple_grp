@@ -166,7 +166,7 @@ class SimpleGRP(nn.Module):
         # chunk size is self.num_action_tokens
         # returns the first predicted action in the chunk
         action_chunk, _ = self(batch)
-        return action_chunk[0,0].float()
+        return action_chunk[0].float().cpu().numpy()
     
 def init_model(transformer_params = {"depth": 6, "heads": 8, "mlp_dim": 2048}, 
                image_params = {"image_shape": (256, 256, 3), "patch_size": 16}, 
@@ -246,7 +246,7 @@ def get_task_text_embeds(tasks, text_tokenizer=None, text_model=None):
     text_masks = torch.cat(text_mask_list, dim=0)[task_ids]
     return text_embeds, text_masks
 
-def evaluate_model(task_suite_name="libero_10", num_trials=5, img_shape=(256, 256, 3)):
+def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 256, 3), num_env_steps=500, num_ol_actions=8):
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[task_suite_name]()  
@@ -285,21 +285,27 @@ def evaluate_model(task_suite_name="libero_10", num_trials=5, img_shape=(256, 25
 
         task_text_embeds, task_attention_mask = task_text_embeds.to(dtype).to(device), task_attention_mask.to(dtype).to(device)
         num_success = 0
-        for _ in range(num_trials):
+        batch_videos_np = np.zeros((num_trials, 500, img_shape[2], img_shape[0], img_shape[1]), dtype=np.uint8)
+        for t in range(num_trials):
             rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
-            frames, cum_reward = run_env(env, rd_task_init_state, task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks)
+            frames, cum_reward = run_env(env, rd_task_init_state, num_env_steps, num_ol_actions,
+                                         task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks)
             # print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
             num_success += cum_reward
-            if use_wandb:
-                wandb.log({"video": wandb.Video(np.transpose(frames, axes=(0,3,1,2)), 
-                                                caption=task_description)})
+            frames_np = np.transpose(frames, axes=(0,3,1,2))
+            batch_videos_np[t, :frames_np.shape[0]] = frames_np
         num_acc = num_success / num_trials
-        wandb.log({"task success": num_acc, "task name": task_name, "task id": task_id})
+        if use_wandb:
+            wandb.log({"video": wandb.Video(batch_videos_np, 
+                                caption=task_description, fps=10, format="mp4"),
+                        "task success": num_acc, "task name": task_name, "task id": task_id})
+        
 
         env.close() 
 
 @torch.no_grad()
-def run_env(env, task_init_state, task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks):
+def run_env(env, task_init_state, num_env_steps, num_ol_actions,
+             task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks):
     model.eval()
 
     env.reset()
@@ -311,23 +317,26 @@ def run_env(env, task_init_state, task_text_embeds, task_attention_mask, obj_tex
         obs, reward, done, info = env.step([0.0] * 6 + [-1.0]) ## dummy action
 
     done, step, frame_list, cum_reward = False, 0, [], 0
-    while not done and step < 750:
+    action_queue = []
+    while not done and step < 500:
         image = obs["agentview_image"][::-1, ::-1].copy()
         # print(image.shape)
         frame_list.append(image)
-        state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
-        if img_only_ctrlo:
-            patch_embed, slot_embed = encode_img(image)
-        else:
-            patch_embed, slot_embed = encode_img_text(image, obj_text_embeds, obj_text_masks)
-        batch = {"patch" : patch_embed.to(dtype).to(device),
-                 "slot": slot_embed.to(dtype).to(device),
-                 "state" : torch.tensor(state).unsqueeze(0).to(device, dtype=dtype),
-                 "text_tokens": task_text_embeds.clone(),
-                 "att_mask": task_attention_mask.clone().reshape(-1, num_tokens, num_tokens)
-                }
-        pred_action =  model.get_action(batch)
-        obs, reward, done, info = env.step(pred_action.cpu().numpy())
+        if not action_queue:
+            state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
+            if img_only_ctrlo:
+                patch_embed, slot_embed = encode_img(image)
+            else:
+                patch_embed, slot_embed = encode_img_text(image, obj_text_embeds, obj_text_masks)
+            batch = {"patch" : patch_embed.to(dtype).to(device),
+                    "slot": slot_embed.to(dtype).to(device),
+                    "state" : torch.tensor(state).unsqueeze(0).to(device, dtype=dtype),
+                    "text_tokens": task_text_embeds.clone(),
+                    "att_mask": task_attention_mask.clone().reshape(-1, num_tokens, num_tokens)
+                    }
+            pred_action =  model.get_action(batch)
+            action_queue.extend(list(pred_action[:num_ol_actions]))
+        obs, reward, done, info = env.step(action_queue.pop(0)) 
         cum_reward += reward
         step += 1
 
@@ -338,6 +347,7 @@ def print_memory_usage():
     print('Memory Cached:   ', round(torch.cuda.memory_reserved(0)/1024**2,1), 'MB')
     mem_in_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
     print(f"Memory usage: {mem_in_mb:.2f} MB")
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype =  torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32 # 
@@ -437,7 +447,7 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(model_path))
         optimizer = None
         loss_function = None
-        from ctrlo.inference import CTRLOFeatureExtractor
+        from ctrlo_inference import CTRLOFeatureExtractor
         ctrlo = CTRLOFeatureExtractor().to(device)
         ctrlo.eval()
 
@@ -467,7 +477,7 @@ if __name__ == "__main__":
     # print(f"Memory usage: {mem_in_mb:.2f} MB")
 
     if do_eval_on_env:
-        evaluate_model(img_shape=(256, 256, 3))
+        evaluate_model(img_shape=(256, 256, 3), num_trials=10, num_env_steps=500, num_ol_actions=8)
     else:
         step = 0
         done = False

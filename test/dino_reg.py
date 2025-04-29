@@ -4,7 +4,7 @@ from torchvision import transforms
 
 from PIL import Image
 import timm
-
+from transformers import AutoImageProcessor, AutoConfig
 from visualize_features import visualize_features_lch
 
 img_size = 224
@@ -27,22 +27,34 @@ img_transform = transforms.Compose(
 )
 if __name__ == "__main__":
     img = Image.open("../data/dog.jpeg")
-
+    img = img.convert("RGB")
+    np_img = np.array(img)[None]
+    np_img = np.repeat(np_img, 2, axis=0)
+    print(np_img.shape)
     model = timm.create_model('timm/vit_small_patch14_reg4_dinov2.lvd142m', # 'vit_large_patch14_reg4_dinov2.lvd142m', 
                             pretrained=True,    
                             img_size=img_size,
                             num_classes=0,  # remove classifier nn.Linear
     )
-    model = model.eval()
+    model.eval()
 
     # get model specific transforms (normalization, resize)
     # data_config = timm.data.resolve_model_data_config(model)
     # print(data_config)
-    # transforms = timm.data.create_transform(**data_config, is_training=False)
-    # print(transforms)
-    # exit(0)
+    # data_config["input_size"] = (3, img_size, img_size)
+    # img_transform = timm.data.create_transform(**data_config, is_training=False)
+    # conf = AutoConfig.from_pretrained('timm/vit_small_patch14_reg4_dinov2.lvd142m', size={"height": img_size, "width": img_size})
+    # print(conf)
+    img_transform = AutoImageProcessor.from_pretrained('facebook/dinov2-with-registers-small', size={"shortest_edge": 224})
+    print(img_transform)
+    # img_transform.data_config['input_size'] = [3, img_size, img_size]  #{"height": img_size, "width": img_size}
+
+    
     with torch.no_grad():
-        output = model.forward_features(img_transform(img))[0, 5:].permute(1,0).reshape(-1, img_size//14, img_size//14)
+        img = img_transform(images=np_img, return_tensors="pt").pixel_values #.unsqueeze(0)
+        print(img.shape)
+        output = model.forward_features(img)#[0, 5:].permute(1,0).reshape(-1, img_size//14, img_size//14)
     print(output.shape)
+
         
-    visualize_features_lch(output, f"dinoreg_small_{img_size}_mt_dog.png")
+    # visualize_features_lch(output, f"dinoreg_small_{img_size}_apt_dog.png")

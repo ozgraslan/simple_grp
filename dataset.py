@@ -5,7 +5,6 @@ from tensordict import TensorDict, MemoryMappedTensor
 import transformers
 from transformers import AutoProcessor, AutoBackbone, AutoConfig
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from ctrlo.inference import CTRLOFeatureExtractor
 from torch.cuda.amp import autocast
 
 from tqdm import tqdm

@@ -142,24 +142,9 @@ class CTRLOFeatureExtractor:
 
 
     def _init_transforms(self):        
-        img_size = 224
-        self.img_transform = transforms.Compose(
-            [   
-                transforms.Lambda(lambda img: img if isinstance(img, torch.Tensor) else torch.from_numpy(img) if isinstance(img, np.ndarray) else torch.from_numpy(np.array(img))),
-                transforms.Lambda(lambda img: img.permute(0,3,1,2) if len(img.shape) == 4 else img.permute(2,0,1)),
-                transforms.Resize(
-                    (img_size, img_size),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
-                ),
-                transforms.CenterCrop(
-                    img_size,
-                ),
+        processor = AutoImageProcessor.from_pretrained('facebook/dinov2-with-registers-small', size={"shortest_edge": 224})
+        self.img_transform = lambda imgs: processor(images=imgs, return_tensors="pt").pixel_values
 
-                transforms.Lambda(lambda img: img.div(255) if isinstance(img, torch.ByteTensor) else img),
-                transforms.Normalize([0.4850, 0.4560, 0.4060], [0.2290, 0.2240, 0.2250]),
-                transforms.Lambda(lambda img: img.unsqueeze(0) if len(img.shape) == 3 else img),
-            ]
-                )
 
     def to(self, device):
         self.ctrlo_model = self.ctrlo_model.to(device=device)

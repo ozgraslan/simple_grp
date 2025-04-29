@@ -24,8 +24,6 @@ from libero_utils import quat2axisangle
 
 import wandb
 
-from ctrlo.inference import CTRLOFeatureExtractor
-
 # helpers
 
 def pair(t):

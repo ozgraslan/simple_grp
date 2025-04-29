@@ -3,3 +3,4 @@ wandb/
 *.png
 *.gif
 *.sbatch
+*.mp4
