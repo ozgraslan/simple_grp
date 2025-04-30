@@ -15,9 +15,6 @@ from torch.utils.data import DataLoader
 
 import transformers
 from transformers import AutoTokenizer, AutoModel
-from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
-from libero_utils import quat2axisangle
 
 import wandb
 from tensordict import TensorDict
@@ -200,10 +197,7 @@ def train_step(batch):
 
 @torch.no_grad()
 def encode_img(b_img):
-    print(b_img.dtype, b_img.shape)
-    transformed_img = img_transform(b_img)
-    print(type(transformed_img), transformed_img.shape)
-    # .to(device)
+    transformed_img = img_transform(b_img).to(device)
     output = dinoreg.forward_features(transformed_img)
     torch.cuda.empty_cache()  # Clears cache # without this model leads to reserving too much memory and crashing in the next iter
     return output
@@ -256,6 +250,8 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10,
         task = task_suite.get_task(task_id)
         task_name = task.name
         task_description = task.language
+        if not ("moka" in task_description.lower()):
+            continue
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
         print(f"[info] retrieving task {task_id} from suite {task_suite_name}, the " + \
             f"language instruction is {task_description}, and the bddl file is {task_bddl_file}")
@@ -276,7 +272,7 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10,
 
         task_text_masks = torch.cat([task_text_masks, torch.ones((task_text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=task_text_masks.dtype)], dim=1)    
         task_attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(task_text_masks.shape[0], 1), task_text_masks)
-        task_attention_mask = torch.logical_not(task_attention_mask)
+        task_attention_mask = torch.logical_not(task_attention_mask) # for nn.MHA
         task_attention_mask = task_attention_mask.unsqueeze(1).repeat(1, transformer_heads, 1, 1)
         # print(num_tokens, task_attention_mask.shape)
 
@@ -284,8 +280,9 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10,
         num_success = 0
         batch_videos_np = np.zeros((num_trials, 500, img_shape[2], img_shape[0], img_shape[1]), dtype=np.uint8)
         for t in range(num_trials):
-            rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
-            frames, cum_reward = run_env(env, rd_task_init_state, num_env_steps, num_ol_actions,
+            #rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
+            task_init_state = env_init_states[t % len(env_init_states)]
+            frames, cum_reward = run_env(env, task_init_state, num_env_steps, num_ol_actions,
                                         task_text_embeds, task_attention_mask)
             # print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
             num_success += cum_reward
@@ -323,9 +320,9 @@ def run_env(env, task_init_state, num_env_steps, num_ol_actions,
             state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
             image_feat = encode_img(image)
             batch = {"image" : image_feat.to(dtype).to(device),
-                    "state" : torch.tensor(state).unsqueeze(0).to(device, dtype=dtype),
-                    "text_tokens": task_text_embeds.clone(),
-                    "att_mask": task_attention_mask.clone().reshape(-1, num_tokens, num_tokens)
+                     "state" : torch.tensor(state).unsqueeze(0).to(device, dtype=dtype),
+                     "text_tokens": task_text_embeds.clone(),
+                     "att_mask": task_attention_mask.clone().reshape(-1, num_tokens, num_tokens)
                     }
             pred_action =  model.get_action(batch)
             action_queue.extend(list(pred_action[:num_ol_actions]))
@@ -342,7 +339,7 @@ def print_memory_usage():
     print(f"Memory usage: {mem_in_mb:.2f} MB")
 
 if __name__ == "__main__":
-    seed = 777
+    seed = 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype =  torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32 # 
     t5_model_name = "google-t5/t5-small"
@@ -361,6 +358,11 @@ if __name__ == "__main__":
     torch_compile = False
     learning_rate = 3e-4
     do_eval_on_env = True
+
+    num_trials = 10
+    num_env_steps = 500
+    num_ol_actions = 8
+
     model_path = "/network/scratch/o/ozgur.aslan/simple_grp/dinoreg_224_grp_final.pt"
     dataset_path = "/network/projects/real-g-grp/libero_td/libero10_dinoreg_224_dataset_792.pt"
 
@@ -414,7 +416,7 @@ if __name__ == "__main__":
         text_masks = torch.cat([text_masks, torch.ones((text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=text_masks.dtype)], dim=1)
 
         attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(text_masks.shape[0], 1), text_masks)
-        attention_mask = torch.logical_not(attention_mask)
+        attention_mask = torch.logical_not(attention_mask) # for nn.MHA
         attention_mask = attention_mask.unsqueeze(1).repeat(1, transformer_heads, 1, 1)
         num_tokens = attention_mask.shape[-1]
 
@@ -438,6 +440,7 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(model_path))
         optimizer = None
         loss_function = None
+
         import timm
         from transformers import AutoImageProcessor
 
@@ -449,7 +452,6 @@ if __name__ == "__main__":
         ).to(device)
         dinoreg.eval()
         processor = AutoImageProcessor.from_pretrained('facebook/dinov2-with-registers-small', size={"shortest_edge": img_size})
-        print(processor)
         img_transform = lambda imgs: processor(images=imgs, return_tensors="pt").pixel_values
 
     else:
@@ -479,7 +481,10 @@ if __name__ == "__main__":
     # print(f"Memory usage: {mem_in_mb:.2f} MB")
 
     if do_eval_on_env:
-        evaluate_model(img_shape=(256, 256, 3), num_trials=10, num_env_steps=500, num_ol_actions=8)
+        from libero.libero import benchmark, get_libero_path
+        from libero.libero.envs import OffScreenRenderEnv
+        from libero_utils import quat2axisangle
+        evaluate_model(img_shape=(256, 256, 3), num_trials=num_trials, num_env_steps=num_env_steps, num_ol_actions=num_ol_actions)
     else:
         step = 0
         done = False

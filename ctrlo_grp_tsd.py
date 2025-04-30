@@ -5,8 +5,7 @@ Based on https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/simple_
 """
 import os
 import psutil
-import torch.cuda
-
+import random
 import numpy as np
 
 import torch
@@ -16,13 +15,9 @@ from torch.utils.data import DataLoader
 
 import transformers
 from transformers import AutoTokenizer, AutoModel
-from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
-from libero_utils import quat2axisangle
 
 import wandb
 from tensordict import TensorDict
-from task2obj import task2obj
 
 # helpers
 def pair(t):
@@ -255,6 +250,9 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 2
         task = task_suite.get_task(task_id)
         task_name = task.name
         task_description = task.language
+        if not ("moka" in task_description.lower()):
+            continue
+
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
         print(f"[info] retrieving task {task_id} from suite {task_suite_name}, the " + \
             f"language instruction is {task_description}, and the bddl file is {task_bddl_file}")
@@ -268,6 +266,7 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 2
         print(env_args)
         # Get default LIBERO initial states
         env_init_states = task_suite.get_task_init_states(task_id)
+        print(f"Task {task_id} has {len(env_init_states)} initial states")
         env = OffScreenRenderEnv(**env_args)
         env.seed(0)
 
@@ -287,8 +286,10 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 2
         num_success = 0
         batch_videos_np = np.zeros((num_trials, 500, img_shape[2], img_shape[0], img_shape[1]), dtype=np.uint8)
         for t in range(num_trials):
-            rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
-            frames, cum_reward = run_env(env, rd_task_init_state, num_env_steps, num_ol_actions,
+            task_init_state = env_init_states[t % len(env_init_states)]
+            # rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
+
+            frames, cum_reward = run_env(env, task_init_state, num_env_steps, num_ol_actions,
                                          task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks)
             # print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
             num_success += cum_reward
@@ -342,6 +343,17 @@ def run_env(env, task_init_state, num_env_steps, num_ol_actions,
 
     return np.stack(frame_list, axis=0), cum_reward
 
+## from openvla github
+def set_seed_everywhere(seed: int):
+    """Sets the random seed for Python, NumPy, and PyTorch functions."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
 def print_memory_usage():
     print('Memory Allocated:', round(torch.cuda.memory_allocated(0)/1024**2,1), 'MB')
     print('Memory Cached:   ', round(torch.cuda.memory_reserved(0)/1024**2,1), 'MB')
@@ -349,6 +361,7 @@ def print_memory_usage():
     print(f"Memory usage: {mem_in_mb:.2f} MB")
 
 if __name__ == "__main__":
+    seed = 9
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype =  torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32 # 
 
@@ -367,19 +380,22 @@ if __name__ == "__main__":
     use_wandb = True
     torch_compile = False
     learning_rate = 3e-4
-    do_eval_on_env = False
+    do_eval_on_env = True
+    num_trials = 10
+    num_env_steps = 500
+    num_ol_actions = 8
 
     # img_only_ctrlo = True
-    # model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_img_224_grp_"
+    # model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_img_224_grp_final.pt"
     # dataset_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_img_224_dataset_792.pt"
 
     img_only_ctrlo = False
-    model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_full_224_grp_"
+    model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_full_224_grp_final.pt"
     dataset_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_full_224_dataset_792.pt"
 
     print("img_ongly_ctrlo:", img_only_ctrlo, model_path, dataset_path)
-
-    # - Calculate train and val episodes
+    print("Doing Eval:", do_eval_on_env, "seed:", seed)
+    set_seed_everywhere(seed)
 
     num_patch_tokens, patch_dim = 256, 384
     num_slot_tokens, slot_dim = 7, 256
@@ -470,7 +486,7 @@ if __name__ == "__main__":
     config = {**model_params, "action_head": "2layer-mlp", "batch_size": batch_size, 
               "training_steps": training_steps,  "lr": learning_rate,
               "loss_function": type(loss_function).__name__, "optimizer": type(optimizer).__name__,
-              "log_freq": log_freq} # , "val_log_freq": val_log_freq
+              "log_freq": log_freq, "seed": seed, "num_trials": num_trials, "num_env_steps": num_env_steps, "num_ol_actions": num_ol_actions} # , "val_log_freq": val_log_freq
     # start a new wandb run to track this script
     if use_wandb:
         wandb.init(
@@ -485,7 +501,12 @@ if __name__ == "__main__":
     # print(f"Memory usage: {mem_in_mb:.2f} MB")
 
     if do_eval_on_env:
-        evaluate_model(img_shape=(256, 256, 3), num_trials=10, num_env_steps=500, num_ol_actions=8)
+        from libero.libero import benchmark, get_libero_path
+        from libero.libero.envs import OffScreenRenderEnv
+        from libero_utils import quat2axisangle
+        from task2obj import task2obj
+
+        evaluate_model(img_shape=(256, 256, 3), num_trials=num_trials, num_env_steps=num_env_steps, num_ol_actions=num_ol_actions)
     else:
         step = 0
         done = False
