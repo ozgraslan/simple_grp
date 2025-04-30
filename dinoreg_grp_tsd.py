@@ -5,8 +5,7 @@ Based on https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/simple_
 """
 import os
 import psutil
-import torch.cuda
-
+import random
 import numpy as np
 
 import torch
@@ -22,7 +21,7 @@ from libero_utils import quat2axisangle
 
 import wandb
 from tensordict import TensorDict
-from task2obj import task2obj
+
 
 # helpers
 def pair(t):
@@ -115,14 +114,14 @@ class Transformer(nn.Module):
 
 class SimpleGRP(nn.Module):
     def __init__(self, *, state_dim, action_dim, dim, depth, heads, mlp_dim, 
-                 patch_dim = 0, slot_dim = 0, num_patch_tokens=0, num_slot_tokens=0, 
+                 img_dim = 0, num_img_tokens=0, 
                  dim_head = 64, num_text_tokens = 0, num_state_tokens=0, num_action_tokens = 0):
         super().__init__()
 
 
 
         pos_embedding = create_sinusoidal_pos_embedding(
-            num_positions = num_text_tokens + num_slot_tokens + num_patch_tokens + num_state_tokens + num_action_tokens,
+            num_positions = num_text_tokens + num_img_tokens + num_state_tokens + num_action_tokens,
             dimension = dim,
         ) 
 
@@ -130,8 +129,7 @@ class SimpleGRP(nn.Module):
         self.register_buffer("pos_embedding", pos_embedding)
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
         
-        self.patch_projection = nn.Linear(patch_dim, dim)
-        self.slot_projection = nn.Linear(slot_dim, dim)
+        self.img_projection = nn.Linear(img_dim, dim)
 
         self.state_projection = nn.Linear(state_dim, dim)
         self.action_token = nn.Embedding(num_action_tokens, dim)
@@ -143,14 +141,13 @@ class SimpleGRP(nn.Module):
         )
 
     def forward(self, batch, return_att=False):
-        batch_size = batch["patch"].shape[0]
-        device = batch["patch"].device
+        batch_size = batch["image"].shape[0]
+        device = batch["image"].device
 
-        slot_tokens = self.slot_projection(batch["slot"])
-        patch_tokens = self.patch_projection(batch["patch"])
+        img_feat_tokens = self.img_projection(batch["image"])
         state_tokens = self.state_projection(batch["state"]).unsqueeze(1)
         action_tokens = self.action_token(torch.arange(self.num_action_tokens, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1))
-        tokens = torch.cat([batch["text_tokens"], slot_tokens, patch_tokens, state_tokens, action_tokens], dim=1)
+        tokens = torch.cat([batch["text_tokens"], img_feat_tokens, state_tokens, action_tokens], dim=1)
         tokens = tokens + self.pos_embedding
 
         # print(tokens.shape, batch["att_mask"].shape)
@@ -179,10 +176,8 @@ def init_model(transformer_params = {"depth": 6, "heads": 8, "mlp_dim": 2048},
         depth = transformer_params["depth"],
         heads = transformer_params["heads"],
         mlp_dim = transformer_params["mlp_dim"],
-        patch_dim = image_params["patch_dim"],
-        slot_dim = image_params["slot_dim"],
-        num_patch_tokens = image_params["num_patch_tokens"],
-        num_slot_tokens = image_params["num_slot_tokens"],
+        img_dim = image_params["img_dim"],
+        num_img_tokens = image_params["num_img_tokens"],
         num_text_tokens=text_token_shape[1],
         num_state_tokens=state_shape[0],
         num_action_tokens=action_shape[0],
@@ -205,20 +200,13 @@ def train_step(batch):
 
 @torch.no_grad()
 def encode_img(b_img):
-    transformed_img = ctrlo.img_transform(b_img[None]).to(ctrlo.device)
-    empty_loss_mask = torch.zeros((1, 7), dtype=int, device=transformed_img.device)
-    embeded_empty_text = torch.ones((1, 7, 512), device=transformed_img.device)
-    outputs = ctrlo.extract_features_batch(transformed_img, empty_loss_mask, embeded_empty_text)
+    print(b_img.dtype, b_img.shape)
+    transformed_img = img_transform(b_img)
+    print(type(transformed_img), transformed_img.shape)
+    # .to(device)
+    output = dinoreg.forward_features(transformed_img)
     torch.cuda.empty_cache()  # Clears cache # without this model leads to reserving too much memory and crashing in the next iter
-    return outputs["feature_extractor"].features, outputs["perceptual_grouping"].objects
-
-
-@torch.no_grad()
-def encode_img_text(b_img, b_text_embed, b_text_mask):
-    transformed_img = ctrlo.img_transform(b_img[None]).to(ctrlo.device)
-    outputs = ctrlo.extract_features_batch(transformed_img, b_text_mask.unsqueeze(0), b_text_embed.unsqueeze(0))
-    torch.cuda.empty_cache()  # Clears cache # without this model leads to reserving too much memory and crashing in the next iter
-    return outputs["feature_extractor"].features, outputs["perceptual_grouping"].objects
+    return output
 
 @torch.no_grad()
 def encode_txt(s, text_tokenizer=None, text_model=None):
@@ -246,7 +234,20 @@ def get_task_text_embeds(tasks, text_tokenizer=None, text_model=None):
     text_masks = torch.cat(text_mask_list, dim=0)[task_ids]
     return text_embeds, text_masks
 
-def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 256, 3), num_env_steps=500, num_ol_actions=8):
+
+## from openvla github
+def set_seed_everywhere(seed: int):
+    """Sets the random seed for Python, NumPy, and PyTorch functions."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+def evaluate_model(task_suite_name="libero_10", num_trials=10, 
+                   img_shape=(256, 256, 3), num_env_steps=500, num_ol_actions=8):
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[task_suite_name]()  
@@ -272,12 +273,8 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 2
         env.seed(0)
 
         task_text_embeds, task_text_masks = encode_txt(task_description, t5_tokenizer, t5_model)
-        obj_text_list = task2obj[task_description]
-        obj_text_embeds, obj_text_masks = ctrlo.embed_text(obj_text_list)
-        # print(obj_text_embeds.shape, obj_text_masks.shape)
-        obj_text_embeds, obj_text_masks = obj_text_embeds.to(dtype).to(device), obj_text_masks.to(dtype).to(device)
 
-        task_text_masks = torch.cat([task_text_masks, torch.ones((task_text_masks.shape[0], num_slot_tokens + num_patch_tokens + num_state_tokens + num_action_tokens), dtype=task_text_masks.dtype)], dim=1)    
+        task_text_masks = torch.cat([task_text_masks, torch.ones((task_text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=task_text_masks.dtype)], dim=1)    
         task_attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(task_text_masks.shape[0], 1), task_text_masks)
         task_attention_mask = torch.logical_not(task_attention_mask)
         task_attention_mask = task_attention_mask.unsqueeze(1).repeat(1, transformer_heads, 1, 1)
@@ -289,7 +286,7 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 2
         for t in range(num_trials):
             rd_task_init_state = env_init_states[np.random.randint(0, len(env_init_states))]
             frames, cum_reward = run_env(env, rd_task_init_state, num_env_steps, num_ol_actions,
-                                         task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks)
+                                        task_text_embeds, task_attention_mask)
             # print("eval cum reward:", cum_reward, "step:", step, "batch*step:", step*batch_size)
             num_success += cum_reward
             frames_np = np.transpose(frames, axes=(0,3,1,2))
@@ -299,13 +296,13 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10, img_shape=(256, 2
             wandb.log({"video": wandb.Video(batch_videos_np, 
                                 caption=task_description, fps=10, format="mp4"),
                         "task success": num_acc, "task name": task_name, "task id": task_id})
-        
+    
 
         env.close() 
 
 @torch.no_grad()
 def run_env(env, task_init_state, num_env_steps, num_ol_actions,
-             task_text_embeds, task_attention_mask, obj_text_embeds, obj_text_masks):
+             task_text_embeds, task_attention_mask):
     model.eval()
 
     env.reset()
@@ -324,12 +321,8 @@ def run_env(env, task_init_state, num_env_steps, num_ol_actions,
         frame_list.append(image)
         if not action_queue:
             state = np.concatenate([obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]], axis=0)
-            if img_only_ctrlo:
-                patch_embed, slot_embed = encode_img(image)
-            else:
-                patch_embed, slot_embed = encode_img_text(image, obj_text_embeds, obj_text_masks)
-            batch = {"patch" : patch_embed.to(dtype).to(device),
-                    "slot": slot_embed.to(dtype).to(device),
+            image_feat = encode_img(image)
+            batch = {"image" : image_feat.to(dtype).to(device),
                     "state" : torch.tensor(state).unsqueeze(0).to(device, dtype=dtype),
                     "text_tokens": task_text_embeds.clone(),
                     "att_mask": task_attention_mask.clone().reshape(-1, num_tokens, num_tokens)
@@ -349,9 +342,9 @@ def print_memory_usage():
     print(f"Memory usage: {mem_in_mb:.2f} MB")
 
 if __name__ == "__main__":
+    seed = 777
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype =  torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32 # 
-
     t5_model_name = "google-t5/t5-small"
     repo_id = "lerobot/libero_10_image"
     batch_size = 256
@@ -367,31 +360,22 @@ if __name__ == "__main__":
     use_wandb = True
     torch_compile = False
     learning_rate = 3e-4
-    do_eval_on_env = False
+    do_eval_on_env = True
+    model_path = "/network/scratch/o/ozgur.aslan/simple_grp/dinoreg_224_grp_final.pt"
+    dataset_path = "/network/projects/real-g-grp/libero_td/libero10_dinoreg_224_dataset_792.pt"
 
-    # img_only_ctrlo = True
-    # model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_img_224_grp_"
-    # dataset_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_img_224_dataset_792.pt"
-
-    img_only_ctrlo = False
-    model_path = "/network/scratch/o/ozgur.aslan/simple_grp/ctrlo_full_224_grp_"
-    dataset_path = "/network/scratch/o/ozgur.aslan/libero_td/libero10_ctrlo_full_224_dataset_792.pt"
-
-    print("img_ongly_ctrlo:", img_only_ctrlo, model_path, dataset_path)
-
-    # - Calculate train and val episodes
-
-    num_patch_tokens, patch_dim = 256, 384
-    num_slot_tokens, slot_dim = 7, 256
+    print("Doing Eval:", do_eval_on_env, "seed:", seed)
+    set_seed_everywhere(seed)
+    num_img_tokens, img_dim = 261, 384
     num_text_tokens = 32
-    num_tokens = num_text_tokens + num_slot_tokens + num_patch_tokens + num_state_tokens + num_action_tokens
+    num_tokens = num_text_tokens + num_img_tokens + num_state_tokens + num_action_tokens
 
 
     t5_tokenizer = AutoTokenizer.from_pretrained(t5_model_name, torch_dtype=dtype)
     t5_model = AutoModel.from_pretrained(t5_model_name, torch_dtype=dtype)
     t5_model.eval()
 
-    block_mask_arr = torch.tensor([1] + (num_slot_tokens + num_text_tokens + num_patch_tokens - 1) * [0] \
+    block_mask_arr = torch.tensor([1] + (num_text_tokens + num_img_tokens - 1) * [0] \
                                 + [1] + (num_state_tokens - 1) * [0] \
                                 + [1] + (num_action_tokens - 1) * [0])
 
@@ -403,7 +387,7 @@ if __name__ == "__main__":
         print(f"Dataset metadata: {dataset_metadata}")
         print(f"Dataset features: {ds_features}")
 
-        train_dataset = TensorDict.load_memmap(dataset_path) #.to(device, dtype=dtype)
+        train_dataset = TensorDict.load_memmap(dataset_path)
         print_memory_usage()
         train_dataset = train_dataset.to(dtype=dtype).to(device)
         torch.cuda.empty_cache()
@@ -427,7 +411,7 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
    
         ## precompute blockwise attention mask
-        text_masks = torch.cat([text_masks, torch.ones((text_masks.shape[0], num_slot_tokens + num_patch_tokens + num_state_tokens + num_action_tokens), dtype=text_masks.dtype)], dim=1)
+        text_masks = torch.cat([text_masks, torch.ones((text_masks.shape[0], num_img_tokens + num_state_tokens + num_action_tokens), dtype=text_masks.dtype)], dim=1)
 
         attention_mask = get_att_mask(block_mask_arr.unsqueeze(0).repeat(text_masks.shape[0], 1), text_masks)
         attention_mask = torch.logical_not(attention_mask)
@@ -439,10 +423,9 @@ if __name__ == "__main__":
     model_params = dict(transformer_params = {"depth": transformer_depth, 
                                               "heads": transformer_heads, 
                                               "mlp_dim": transformer_mlp_dim}, 
-                        image_params =  {"patch_dim": patch_dim, 
-                                         "slot_dim": slot_dim, 
-                                         "num_patch_tokens": num_patch_tokens,
-                                         "num_slot_tokens": num_slot_tokens}, 
+                        image_params =  {"img_dim": img_dim, 
+                                         "num_img_tokens": num_img_tokens,
+                                         }, 
                         text_token_shape = (0, 32,512),
                         state_shape = (num_state_tokens, 8), 
                         action_shape = (num_action_tokens, 7))
@@ -455,9 +438,19 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(model_path))
         optimizer = None
         loss_function = None
-        from ctrlo_inference import CTRLOFeatureExtractor
-        ctrlo = CTRLOFeatureExtractor().to(device)
-        ctrlo.eval()
+        import timm
+        from transformers import AutoImageProcessor
+
+        img_size = 224
+        dinoreg = timm.create_model('timm/vit_small_patch14_reg4_dinov2.lvd142m',
+                                pretrained=True,    
+                                img_size=img_size,
+                                num_classes=0,  # remove classifier nn.Linear
+        ).to(device)
+        dinoreg.eval()
+        processor = AutoImageProcessor.from_pretrained('facebook/dinov2-with-registers-small', size={"shortest_edge": img_size})
+        print(processor)
+        img_transform = lambda imgs: processor(images=imgs, return_tensors="pt").pixel_values
 
     else:
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
@@ -470,7 +463,8 @@ if __name__ == "__main__":
     config = {**model_params, "action_head": "2layer-mlp", "batch_size": batch_size, 
               "training_steps": training_steps,  "lr": learning_rate,
               "loss_function": type(loss_function).__name__, "optimizer": type(optimizer).__name__,
-              "log_freq": log_freq} # , "val_log_freq": val_log_freq
+              "log_freq": log_freq, "seed": seed} 
+    
     # start a new wandb run to track this script
     if use_wandb:
         wandb.init(
@@ -493,8 +487,7 @@ if __name__ == "__main__":
             for batch in train_dl:
                 torch.cuda.empty_cache()
                 # batch = batch.to(device)
-                batch = {"patch": batch["patch"].contiguous(), 
-                         "slot": batch["slot"].contiguous(),
+                batch = {"image": batch["image"].contiguous(), 
                          "state": batch["state"].contiguous(),
                          "action": batch["action"].contiguous(),
                          "valid_mask": batch["valid_mask"].contiguous().unsqueeze(-1),
