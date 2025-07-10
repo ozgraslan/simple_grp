@@ -1,54 +1,26 @@
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tensordict import TensorDict, MemoryMappedTensor
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from ctrlo_inference import CTRLOFeatureExtractor
+import timm
+from transformers import AutoImageProcessor
 
 from tqdm import tqdm
 
 import psutil
 import os
 
-@torch.no_grad()
-def get_obj_text_embeds(tasks, task2obj):
-    text_embed_list = []
-    text_mask_list = []
-    task_ids = []
-
-    ## did a loop because I am not sure if items returned in order
-    for task_id, task_text in tasks.items():
-        obj_text_list = task2obj[task_text]
-        task_ids.append(task_id)
-        text_embed, text_mask = ctrlo.embed_text(obj_text_list)
-        # print(text_embed.shape, text_mask.shape)
-        text_embed_list.append(text_embed)
-        text_mask_list.append(text_mask)
-
-    task_ids = torch.tensor(task_ids, dtype=torch.long)
-
-    ## preserve order using task ids
-    text_embeds = torch.stack(text_embed_list, dim=0)[task_ids]
-    text_masks = torch.stack(text_mask_list, dim=0)[task_ids]
-    return text_embeds, text_masks
 
 
 @torch.no_grad()
 def encode_img(b_img):
-    bsz = b_img.shape[0]
-    transformed_img = ctrlo.img_transform((255 * b_img).to(torch.uint8).permute(0,2,3,1).cpu().numpy()).to(ctrlo.device)
-    empty_loss_mask = torch.zeros((bsz, 7), dtype=int, device=transformed_img.device)
-    embeded_empty_text = torch.ones((bsz, 7, 512), device=transformed_img.device)
-    outputs = ctrlo.extract_features_batch(transformed_img, empty_loss_mask, embeded_empty_text)
+    transformed_img = img_transform((255 * b_img).to(torch.uint8).permute(0,2,3,1).cpu().numpy()).to(device)
+    output = dino.forward_features(transformed_img)
     torch.cuda.empty_cache()  # Clears cache # without this model leads to reserving too much memory and crashing in the next iter
-    return outputs["feature_extractor"].features, outputs["perceptual_grouping"].objects
+    return output
 
-@torch.no_grad()
-def encode_img_text(b_img, b_text_embed, b_text_mask):
-    transformed_img = ctrlo.img_transform((255 * b_img).to(torch.uint8).permute(0,2,3,1).cpu().numpy()).to(ctrlo.device)
-    outputs = ctrlo.extract_features_batch(transformed_img, b_text_mask, b_text_embed)
-    torch.cuda.empty_cache()  # Clears cache # without this model leads to reserving too much memory and crashing in the next iter
-    return outputs["feature_extractor"].features, outputs["perceptual_grouping"].objects
 
 def get_empty_td_dataset(dct, dataset_size, device="cpu"):
     data_td = TensorDict(
@@ -67,38 +39,35 @@ if __name__ == "__main__":
 
     # dtype = torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32
 
-    # repo_id = "lerobot/libero_10_image"
     repo_id = "lerobot/libero_spatial_image"
 
-    selected_columns = {"observation.images.image": ("patch", "slot"), "task_index": "task_index",
+    selected_columns = {"observation.images.image": "image", "task_index": "task_index",
                         "observation.state": "state", "action": "action", "action_is_pad": "valid_mask"}
 
     num_action_tokens = 32
 
 
-    data_dct = {"patch": {"shape": (256, 384), "dtype": dtype},
-                "slot": {"shape": (7, 256), "dtype": dtype},
+    data_dct = {"image": {"shape": (257, 384), "dtype": dtype},
                 "state": {"shape": (8,), "dtype": dtype},
                 "action": {"shape": (num_action_tokens, 7), "dtype": dtype},
                 "action_is_pad" : {"shape": (num_action_tokens,), "dtype": dtype},
                 "task_index": {"shape": (), "dtype": dtype},
     }
 
+    img_size = 224
+    dino = timm.create_model('timm/vit_small_patch14_dinov2.lvd142m',
+                            pretrained=True,    
+                            img_size=img_size,
+                            num_classes=0,  # remove classifier nn.Linear
+    ).to(device)
+    dino.eval()
+    processor = AutoImageProcessor.from_pretrained('facebook/dinov2-small', size={"shortest_edge": img_size})
+    img_transform = lambda imgs: processor(images=imgs, return_tensors="pt").pixel_values
+    save_path = "/network/scratch/o/ozgur.aslan/libero_td/libero_sp_dino_224_dataset"
+
+
 
     dataset_metadata = LeRobotDatasetMetadata(repo_id)
-    tasks = dataset_metadata.tasks
-    from task2obj import task2obj2
-    ctrlo = CTRLOFeatureExtractor().to(device)
-    ctrlo.eval()
-    save_path = "/network/scratch/o/ozgur.aslan/libero_td/libero_sp_ctrlo_img_224_dataset"
-    img_only = True
-    print(f"Image only: {img_only} {save_path}")
-    if not img_only:
-        text_embeds, text_masks = get_obj_text_embeds(tasks, task2obj2)
-        text_embeds, text_masks = text_embeds.to(device), text_masks.to(device)
-
-    # print(text_embeds.shape , text_masks.shape)
-
     ds_features = dataset_metadata.features
 
     delta_timestamps = {
@@ -127,15 +96,8 @@ if __name__ == "__main__":
         for key in selected_columns.keys():
             if key == "observation.images.image":
                 b_img = batch[key]
-                if img_only:
-                    out = encode_img(b_img)
-                else:
-                    b_text_embed = text_embeds[batch["task_index"].long()]
-                    b_text_mask = text_masks[batch["task_index"].long()]
-                    # print(b_img.shape, b_text_embed.shape, b_text_mask.shape)
-                    out = encode_img_text(b_img, b_text_embed, b_text_mask)
-                dct[selected_columns[key][0]] = out[0] #.to(device, dtype=dtype)
-                dct[selected_columns[key][1]] = out[1] #.to(device, dtype=dtype)
+                out = encode_img(b_img)
+                dct[selected_columns[key]] = out #.to(device, dtype=dtype)
             elif key == "action_is_pad":
                 dct[selected_columns[key]] = (~ batch[key]) #.to(device=device, dtype=dtype)
             else:

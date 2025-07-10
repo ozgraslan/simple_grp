@@ -39,7 +39,7 @@ if __name__ == "__main__":
 
     # dtype = torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32
 
-    repo_id = "lerobot/libero_10_image"
+    repo_id = "lerobot/libero_spatial_image"
 
     selected_columns = {"observation.images.image": "image", "task_index": "task_index",
                         "observation.state": "state", "action": "action", "action_is_pad": "valid_mask"}
@@ -63,7 +63,7 @@ if __name__ == "__main__":
     dinoreg.eval()
     processor = AutoImageProcessor.from_pretrained('facebook/dinov2-with-registers-small', size={"shortest_edge": img_size})
     img_transform = lambda imgs: processor(images=imgs, return_tensors="pt").pixel_values
-    save_path = "/network/projects/real-g-grp/libero_td/libero10_dinoreg_224_dataset"
+    save_path = "/network/projects/real-g-grp/libero_td/libero_sp_dinoreg_224_dataset"
 
 
 
@@ -81,11 +81,11 @@ if __name__ == "__main__":
     print(f"Number of frames in training dataset (100s% subset): {len(dataset)}")
 
     loader = DataLoader(dataset,
-                          num_workers=0,
-                          batch_size=bs,
-                          shuffle=False,
-                          pin_memory=device != "cpu",
-                          drop_last=True,) # makes avg comp easier
+                        num_workers=0,
+                        batch_size=bs,
+                        shuffle=False,
+                        pin_memory=device != "cpu",
+                        drop_last=True,) # makes avg comp easier
 
     train_td_dict = get_empty_td_dataset(data_dct, bs*(len(dataset)//bs), device="cpu")
     print(train_td_dict)

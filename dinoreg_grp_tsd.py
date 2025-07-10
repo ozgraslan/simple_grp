@@ -250,8 +250,8 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10,
         task = task_suite.get_task(task_id)
         task_name = task.name
         task_description = task.language
-        if not ("moka" in task_description.lower()):
-            continue
+        # if not ("moka" in task_description.lower()):
+        #     continue
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
         print(f"[info] retrieving task {task_id} from suite {task_suite_name}, the " + \
             f"language instruction is {task_description}, and the bddl file is {task_bddl_file}")
@@ -290,9 +290,10 @@ def evaluate_model(task_suite_name="libero_10", num_trials=10,
             batch_videos_np[t, :frames_np.shape[0]] = frames_np
         num_acc = num_success / num_trials
         if use_wandb:
-            wandb.log({"video": wandb.Video(batch_videos_np, 
+            wandb.log({
+                        "video": wandb.Video(batch_videos_np, 
                                 caption=task_description, fps=10, format="mp4"),
-                        "task success": num_acc, "task name": task_name, "task id": task_id})
+                        "task success": num_acc, "task id": task_id})
     
 
         env.close() 
@@ -342,11 +343,14 @@ if __name__ == "__main__":
     seed = 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype =  torch.bfloat16 if transformers.file_utils.is_torch_bf16_available() else torch.float32 # 
+
+    wproject = "sgrp-liberospimg"
+    # wproject = "sgrp-libero10img"
     t5_model_name = "google-t5/t5-small"
     repo_id = "lerobot/libero_10_image"
     batch_size = 256
     training_steps = 0
-    training_epochs = 100
+    training_epochs = 10
     log_freq = 100
     save_log_freq = 10000
     num_state_tokens = 1
@@ -357,14 +361,18 @@ if __name__ == "__main__":
     use_wandb = True
     torch_compile = False
     learning_rate = 3e-4
-    do_eval_on_env = True
+    do_eval_on_env = False
 
-    num_trials = 10
+    num_trials = 50
     num_env_steps = 500
     num_ol_actions = 8
 
-    model_path = "/network/scratch/o/ozgur.aslan/simple_grp/dinoreg_224_grp_final.pt"
-    dataset_path = "/network/projects/real-g-grp/libero_td/libero10_dinoreg_224_dataset_792.pt"
+    # grp_model_name = "dinoreg_224_grp_10_final.pt"
+    grp_model_name = "dinoreg_sp_224_grp_10_"
+
+    model_path = f"/network/scratch/o/ozgur.aslan/simple_grp/{grp_model_name}"
+    # dataset_path = "/network/projects/real-g-grp/libero_td/libero10_dinoreg_224_dataset_792.pt"
+    dataset_path = "/network/projects/real-g-grp/libero_td/libero_sp_dinoreg_224_dataset_413.pt"
 
     print("Doing Eval:", do_eval_on_env, "seed:", seed)
     set_seed_everywhere(seed)
@@ -395,7 +403,7 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
         print_memory_usage()
         print(train_dataset)
-        save_log_freq = (train_dataset.batch_size[0] // batch_size) * 10
+        save_log_freq = (train_dataset.batch_size[0] // batch_size) 
         training_steps = (train_dataset.batch_size[0] // batch_size) * training_epochs
         print(save_log_freq, training_steps)
         train_dl = DataLoader(train_dataset,
@@ -462,15 +470,19 @@ if __name__ == "__main__":
     if torch_compile:
         model = torch.compile(model)
 
-    config = {**model_params, "action_head": "2layer-mlp", "batch_size": batch_size, 
+    config = {
+              **model_params, "action_head": "2layer-mlp", "batch_size": batch_size, 
               "training_steps": training_steps,  "lr": learning_rate,
               "loss_function": type(loss_function).__name__, "optimizer": type(optimizer).__name__,
-              "log_freq": log_freq, "seed": seed} 
+              "log_freq": log_freq, "num_trials": num_trials, 
+              "num_env_steps": num_env_steps, "num_ol_actions": num_ol_actions,
+              "seed": seed, "grp_model_name": grp_model_name
+            } 
     
     # start a new wandb run to track this script
     if use_wandb:
         wandb.init(
-            project = "sgrp-libero10img",
+            project = wproject,
             # track hyperparameters and run metadata
             config = config,
         )

@@ -1,6 +1,7 @@
 __pycache__/
 wandb/
 *.png
+*.pdf
 *.jpeg
 *.gif
 *.sbatch

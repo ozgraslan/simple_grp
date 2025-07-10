@@ -16,7 +16,7 @@ from einops.layers.torch import Rearrange
 
 import transformers
 from transformers import AutoTokenizer, AutoModel, AutoConfig, AutoProcessor, AutoBackbone
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from libero_utils import quat2axisangle
