@@ -36,7 +36,7 @@ import numpy as np
 from PIL import Image
 
 from transformers import AutoConfig, AutoProcessor, AutoBackbone, AutoTokenizer, AutoModel
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 
 def apply_mask(image, mask, color, alpha=0.5):
@@ -131,7 +131,7 @@ if __name__ == '__main__':
     vis_backbone.to(device)
 
     from simple_grp_tsd import init_model, get_task_text_embeds, get_att_mask
-    from dataset import encode_img
+    from create_dataset import encode_img
     dataset_metadata = LeRobotDatasetMetadata("lerobot/libero_10_image")
     ds_features = dataset_metadata.features
 

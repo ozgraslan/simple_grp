@@ -1,32 +1,29 @@
-# import argparse
-# import json
 import logging
 import os
-# import pathlib
-# import pickle
-# import sys
-# from typing import Dict, Optional, Tuple
 
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
 import torch
-import torchvision
-# import tqdm
-# import webdataset
-# from ocl import visualizations
 from ocl.cli import train
 from omegaconf import OmegaConf
 from PIL import Image
-# from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from transformers import (AutoTokenizer, CLIPTextModel, AutoImageProcessor)
+from transformers import AutoImageProcessor
 
-# import handlers
-# from llm2vec import LLM2Vec
+from llm2vec import LLM2Vec
 import textwrap
 
+from base_feature_extractor import BaseFeatureExtractor
+from utils import is_uint8
+
+logging.getLogger().setLevel(logging.INFO)
+
+CHECKPOINTS = {
+    "checkpoint": "/network/scratch/o/ozgur.aslan/ctrlo/pretrained_model.ckpt",
+    "config": "/network/scratch/o/ozgur.aslan/ctrlo/config.yaml",
+    "text_model": ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-unsup-simcse"),
+}
 
 def visualize(prompts, images, outputs, save_path):
     # Prepare a figure for visualization with larger size and smaller gaps between subplots
@@ -43,17 +40,18 @@ def visualize(prompts, images, outputs, save_path):
         (0, 1, 1),  # Cyan
         (0.75, 0.75, 0.75),  # Bright Gray
     ]
-
+    if images.dtype == np.uint8:
+        images = images / 255.0 
     # Visualize for each prompt
     for i, prompt in enumerate(prompts):
         # Original image (resized for visualization)
-        image_np = images[i].squeeze(0).permute(1, 2, 0).cpu().numpy()
+        image_np = images[i].copy()
         axes[i, 0].imshow(cv2.resize(image_np, (768, 768), interpolation=cv2.INTER_NEAREST))
         axes[i, 0].axis('off')
 
         # Get masks for the current prompt
         
-        image_shape = images[i:i + 1].shape[2:]
+        image_shape = image_np.shape[:-1]
         masks_as_image = outputs['object_decoder'].masks_as_image[i]
         masks = masks_as_image.view(-1, 1, *image_shape)
         
@@ -103,20 +101,11 @@ def visualize(prompts, images, outputs, save_path):
 
     print(f"Combined visualization saved to {combined_image_path}")
 
-logging.getLogger().setLevel(logging.INFO)
 
-# TODO: Use CVPR submission checkpoints --- these checkpoints are recent I suppose
-CHECKPOINTS = {
-    "checkpoint": "/home/mila/o/ozgur.aslan/git/simple_grp/ctrlo/model.ckpt",
-    "config": "/home/mila/o/ozgur.aslan/git/simple_grp/ctrlo/config.yaml",
-    "text_model": "openai/clip-vit-base-patch32",
-}
-
-
-class CTRLOFeatureExtractor:
+class CTRLOFeatureExtractor(BaseFeatureExtractor):
     """Handles feature extraction for multiple vision models."""
 
-    def __init__(self):
+    def __init__(self, config):
         self._init_models()
         self._init_transforms()
         
@@ -132,25 +121,32 @@ class CTRLOFeatureExtractor:
         self.ctrlo_model = train.build_model_from_config(
             oclf_config, encoder_checkpoint_path
         )
-        text_model_path = CHECKPOINTS[
+        text_model_tuple = CHECKPOINTS[
             "text_model"
         ]
-        self.text_tokenizer = AutoTokenizer.from_pretrained(text_model_path)
-        self.text_model = CLIPTextModel.from_pretrained(text_model_path)
+        self.text_model = LLM2Vec.from_pretrained(
+            text_model_tuple[0],
+            peft_model_name_or_path=text_model_tuple[1],
+            torch_dtype=torch.bfloat16
+        )
         self.bbox_cent = torch.tensor([[-1, -1]] * 7, dtype=torch.float32)
         self.bbox_inst = torch.tensor([[-1, -1, -1, -1]] * 7, dtype=torch.float32)
 
-
     def _init_transforms(self):        
-        processor = AutoImageProcessor.from_pretrained('facebook/dinov2-with-registers-small', size={"shortest_edge": 224})
-        self.img_transform = lambda imgs: processor(images=imgs, return_tensors="pt").pixel_values
+        processor = AutoImageProcessor.from_pretrained(
+            'facebook/dinov2-with-registers-small', 
+            size={"height": 224, "width": 224}, 
+            do_center_crop=False,
+            do_resize=True,
+        )
+        print(processor)
+        self.img_transform = lambda imgs, do_rescale: processor(images=imgs, do_rescale=do_rescale, return_tensors="pt").pixel_values
 
-
-    def to(self, device):
-        self.ctrlo_model = self.ctrlo_model.to(device=device)
-        self.text_model = self.text_model.to(device=device)
-        self.bbox_cent = self.bbox_cent.to(device=device)
-        self.bbox_inst = self.bbox_inst.to(device=device)
+    def to(self, device_or_dtype):
+        self.ctrlo_model = self.ctrlo_model.to(device_or_dtype)
+        self.text_model = self.text_model.to(device_or_dtype)
+        self.bbox_cent = self.bbox_cent.to(device_or_dtype)
+        self.bbox_inst = self.bbox_inst.to(device_or_dtype)
         return self
 
     @property
@@ -164,82 +160,78 @@ class CTRLOFeatureExtractor:
     def train(self):
         self.ctrlo_model.train()
         self.text_model.train()
-        
-    def embed_text(self, text):
-        tokenized_text = self.text_tokenizer(text, 
-                                             padding="max_length", max_length=32,
-                                             return_tensors="pt").input_ids.to(self.text_model.device)
-        embeded_text = self.text_model(input_ids=tokenized_text).pooler_output
-        contrastive_loss_mask = torch.tensor([int(p != "other") for p in text])
-        return embeded_text, contrastive_loss_mask
-
-    
-    def embed_img_single_text(self, img, text):
-        transformed_img = self.img_transform(img)
-        embeded_text, contrastive_loss_mask = self.embed_text(text)
-        print(transformed_img.shape, embeded_text.shape)
-        outputs = self.extract_features_batch(transformed_img, contrastive_loss_mask.unsqueeze(0), embeded_text.unsqueeze(0))
-        return outputs
-
-    def embed_batch_img(self, img):
-        transformed_img = self.img_transform(img)
-        bsz = transformed_img.shape[0]
-        print(transformed_img.shape)
-        empty_loss_mask = torch.zeros((bsz, 7), dtype=int, device=transformed_img.device)
-        embeded_empty_text = torch.ones((bsz,7,512), device=transformed_img.device)
-        outputs = self.extract_features_batch(transformed_img, empty_loss_mask, embeded_empty_text)
-        return outputs
-
-    def embed_batch_img_single_text(self, img_batch, text):
-        transformed_img = self.img_transform(img_batch)
-        bsz = transformed_img.shape[0]
-        embeded_text, contrastive_loss_mask = self.embed_text(text)
-        outputs = self.extract_features_batch(transformed_img, contrastive_loss_mask.repeat(bsz, 1), embeded_text.repeat(bsz, 1, 1))
-        return outputs
 
     def extract_features_batch(self, images, contrastive_loss_mask, name_embeddings):
         """Extract features for a batch of images."""
         bsz = images.shape[0]
-        # print(images.dtype, self.bbox_inst.dtype)
-        # print(images.shape, contrastive_loss_mask.shape, name_embeddings.shape)
         inputs = {
-            "image": images.to(device=self.bbox_inst.device),
+            "image": images.to(device=self.device),
             "bbox_centroids": self.bbox_cent.repeat(bsz, 1, 1),
-            "contrastive_loss_mask": contrastive_loss_mask.to(device=self.bbox_inst.device),
-            "name_embedding": name_embeddings.to(device=self.bbox_inst.device),
+            "contrastive_loss_mask": contrastive_loss_mask.to(device=self.device),
+            "name_embedding": name_embeddings.to(device=self.device),
             "instance_bbox": self.bbox_inst.repeat(bsz, 1, 1),
             "batch_size": bsz,
         }
         outputs = self.ctrlo_model(inputs)
         return outputs
+    
+    @torch.no_grad()
+    def embed_text(self, text_list):
+        embeded_text = self.text_model.encode(text_list)
+        contrastive_loss_mask = torch.tensor([int(text != "other") for text in text_list])
+        return embeded_text, contrastive_loss_mask
+    
+    @torch.no_grad()
+    def embed_img_text(self, img, text_embed, text_mask):
+        transformed_img = self.img_transform(img, do_rescale = is_uint8(img))
+        outputs = self.extract_features_batch(transformed_img, text_mask.unsqueeze(0), text_embed.unsqueeze(0))
+        return outputs
+
+    @torch.no_grad()
+    def embed(self, images, task_index, text_embeds, text_masks):
+        transformed_img = self.img_transform(images, do_rescale = is_uint8(images))
+
+        outputs = self.extract_features_batch(transformed_img, text_masks[task_index], text_embeds[task_index])
+        return  {"patch": outputs["feature_extractor"].features, 
+                 "slot": outputs["perceptual_grouping"].objects}
+    
+    @torch.no_grad()
+    def prepare_tasks(self, tasks, task2obj, **kwargs):
+        text_embed_list = []
+        text_mask_list = []
+        task_ids = []
+
+        ## did a loop because I am not sure if items returned in order
+        for task_id, task_text in tasks.items():
+            obj_text_list = task2obj[task_text]
+            task_ids.append(task_id)
+            text_embed, text_mask = self.embed_text(obj_text_list)
+            # print(text_embed.shape, text_mask.shape)
+            text_embed_list.append(text_embed)
+            text_mask_list.append(text_mask)
+
+        task_ids = torch.tensor(task_ids, dtype=torch.long)
+
+        ## preserve order using task ids
+        text_embeds = torch.stack(text_embed_list, dim=0)[task_ids]
+        text_masks = torch.stack(text_mask_list, dim=0)[task_ids]
+        return {"text_embeds": text_embeds, "text_masks": text_masks}
 
 
-def denormalize(image_tensor, mean, std):
-    # Ensure the tensor is in the right format
-    image_tensor = image_tensor * torch.tensor(std, device=image_tensor.device).view(1, -1, 1, 1) + torch.tensor(mean, device=image_tensor.device).view(1, -1, 1, 1)
-    return image_tensor
 
 if __name__ == "__main__":
     # "put both the alphabet soup and the cream cheese box in the basket"
     # you can specify upto 7 regions or objects phrases, the rest will be "other"
-    prompts = [
-        ["the alphabet soup", "the blue cream cheese box", "the basket box", "manipulator", "the orange juice box", "other", "other"],
-        ["left dog", "right dog", "grass", "flowers", "eyes", "ears", "other"],
+    prompt = ["The robot arm", "the alphabet soup", "the cream cheese box", "the basket box", "the orange juice box", "other", "other"]
 
-    ]
-    images = [
-        "../data/agentview_image.png",
-        "../data/agentview_image.png",
-    ]
+    image = "./data/agentview_image.png"
 
     feature_extractor = CTRLOFeatureExtractor().to(device="cuda")
-    np_images = np.stack([np.array(Image.open(img).convert("RGB")) for img in images], axis=0)
-    save_path = "img_only_224_cc.png"
-    outputs = feature_extractor.embed_batch_img(np_images[0]) #, , prompts[0]
+    np_images = np.array(Image.open(image).convert("RGB").resize((224, 224)), dtype=np.uint8)
+    save_path = "test4.png"
+
+    embeded_text, contrastive_loss_mask = feature_extractor.embed_text(prompt)
+    outputs = feature_extractor.embed_img_text(np_images, embeded_text, contrastive_loss_mask)
+    print(outputs.keys())
     print(outputs["feature_extractor"].features.shape)
-    denormed_img = denormalize(feature_extractor.img_transform(np_images), [0.4850, 0.4560, 0.4060], [0.2290, 0.2240, 0.2250])
-    visualize([[""]*7], denormed_img, outputs, save_path)
-    # print(outputs.keys())
-    pg = outputs["perceptual_grouping"]
-    print(pg.objects, pg.feature_attributions.shape)
-    exit(0)
+    visualize([prompt], np_images[None], outputs, save_path)

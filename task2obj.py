@@ -1,4 +1,4 @@
-task2obj = {
+task2obj_10 = {
     "put the white mug on the left plate and put the yellow and white mug on the right plate":\
     ["the white mug", "on the left plate", "the yellow and white mug", "on the right plate", "other", "other", "other"],
     "put the white mug on the plate and put the chocolate pudding to the right of the plate":\
@@ -21,7 +21,7 @@ task2obj = {
     ["the book", "in the back compartment of the caddy", "other", "other", "other", "other", "other"]
 }
 
-task2obj2 = {
+task2obj2_spa = {
     "pick up the black bowl next to the cookie box and place it on the plate":\
     ["the black bowl", "next to the cookie box", "on the plate", "other", "other", "other", "other"],
     "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate":\
