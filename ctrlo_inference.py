@@ -6,6 +6,7 @@ import cv2
 import matplotlib.pyplot as plt
 
 import torch
+from torch import nn
 from ocl.cli import train
 from omegaconf import OmegaConf
 from PIL import Image
@@ -14,7 +15,6 @@ from transformers import AutoImageProcessor
 from llm2vec import LLM2Vec
 import textwrap
 
-from base_feature_extractor import BaseFeatureExtractor
 from utils import is_uint8
 
 logging.getLogger().setLevel(logging.INFO)
@@ -102,10 +102,11 @@ def visualize(prompts, images, outputs, save_path):
     print(f"Combined visualization saved to {combined_image_path}")
 
 
-class CTRLOFeatureExtractor(BaseFeatureExtractor):
+class CTRLOFeatureExtractor(nn.Module):
     """Handles feature extraction for multiple vision models."""
 
-    def __init__(self, config):
+    def __init__(self, config=None):
+        super().__init__()
         self._init_models()
         self._init_transforms()
         
@@ -129,8 +130,8 @@ class CTRLOFeatureExtractor(BaseFeatureExtractor):
             peft_model_name_or_path=text_model_tuple[1],
             torch_dtype=torch.bfloat16
         )
-        self.bbox_cent = torch.tensor([[-1, -1]] * 7, dtype=torch.float32)
-        self.bbox_inst = torch.tensor([[-1, -1, -1, -1]] * 7, dtype=torch.float32)
+        self.bbox_cent = nn.Parameter(torch.tensor([[-1, -1]] * 7, dtype=torch.float32)) 
+        self.bbox_inst = nn.Parameter(torch.tensor([[-1, -1, -1, -1]] * 7, dtype=torch.float32))
 
     def _init_transforms(self):        
         processor = AutoImageProcessor.from_pretrained(
@@ -142,24 +143,24 @@ class CTRLOFeatureExtractor(BaseFeatureExtractor):
         print(processor)
         self.img_transform = lambda imgs, do_rescale: processor(images=imgs, do_rescale=do_rescale, return_tensors="pt").pixel_values
 
-    def to(self, device_or_dtype):
-        self.ctrlo_model = self.ctrlo_model.to(device_or_dtype)
-        self.text_model = self.text_model.to(device_or_dtype)
-        self.bbox_cent = self.bbox_cent.to(device_or_dtype)
-        self.bbox_inst = self.bbox_inst.to(device_or_dtype)
-        return self
+    # def to(self, device_or_dtype):
+    #     self.ctrlo_model = self.ctrlo_model.to(device_or_dtype)
+    #     self.text_model = self.text_model.to(device_or_dtype)
+    #     self.bbox_cent = self.bbox_cent.to(device_or_dtype)
+    #     self.bbox_inst = self.bbox_inst.to(device_or_dtype)
+    #     return self
 
-    @property
-    def device(self):
-        return self.bbox_cent.device
+    # @property
+    # def device(self):
+    #     return self.bbox_cent.device
 
-    def eval(self):
-        self.ctrlo_model.eval()
-        self.text_model.eval()
+    # def eval(self):
+    #     self.ctrlo_model.eval()
+    #     self.text_model.eval()
 
-    def train(self):
-        self.ctrlo_model.train()
-        self.text_model.train()
+    # def train(self):
+    #     self.ctrlo_model.train()
+    #     self.text_model.train()
 
     def extract_features_batch(self, images, contrastive_loss_mask, name_embeddings):
         """Extract features for a batch of images."""
@@ -174,7 +175,12 @@ class CTRLOFeatureExtractor(BaseFeatureExtractor):
         }
         outputs = self.ctrlo_model(inputs)
         return outputs
-    
+
+    def forward(self, images, text_masks, text_embeds):
+        transformed_img = self.img_transform(images, do_rescale = is_uint8(images))
+        outputs = self.extract_features_batch(transformed_img, text_masks, text_embeds)
+        return outputs
+
     @torch.no_grad()
     def embed_text(self, text_list):
         embeded_text = self.text_model.encode(text_list)
@@ -183,18 +189,15 @@ class CTRLOFeatureExtractor(BaseFeatureExtractor):
     
     @torch.no_grad()
     def embed_img_text(self, img, text_embed, text_mask):
-        transformed_img = self.img_transform(img, do_rescale = is_uint8(img))
-        outputs = self.extract_features_batch(transformed_img, text_mask.unsqueeze(0), text_embed.unsqueeze(0))
-        return outputs
+        return self.forward(img, text_mask.unsqueeze(0), text_embed.unsqueeze(0))
 
     @torch.no_grad()
     def embed(self, images, task_index, text_embeds, text_masks):
-        transformed_img = self.img_transform(images, do_rescale = is_uint8(images))
-
-        outputs = self.extract_features_batch(transformed_img, text_masks[task_index], text_embeds[task_index])
+        outputs = self.forward(images, text_masks[task_index], text_embeds[task_index])
         return  {"patch": outputs["feature_extractor"].features, 
                  "slot": outputs["perceptual_grouping"].objects}
-    
+
+
     @torch.no_grad()
     def prepare_tasks(self, tasks, task2obj, **kwargs):
         text_embed_list = []
@@ -226,7 +229,7 @@ if __name__ == "__main__":
 
     image = "./data/agentview_image.png"
 
-    feature_extractor = CTRLOFeatureExtractor().to(device="cuda")
+    feature_extractor = CTRLOFeatureExtractor().to("cuda")
     np_images = np.array(Image.open(image).convert("RGB").resize((224, 224)), dtype=np.uint8)
     save_path = "test4.png"
 

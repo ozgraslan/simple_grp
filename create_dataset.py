@@ -26,7 +26,7 @@ ctrlo_config = Config(
     memory_limit_in_mb=120000,
 )
 
-print(ctrlo_config)
-ctrlo = CTRLOFeatureExtractor(ctrlo_config).to(ctrlo_config.device)
-ctrlo.eval()
-create_td_dataset(ctrlo, ctrlo_config)
+if __name__ == "__main__":
+    ctrlo = CTRLOFeatureExtractor(None).to(ctrlo_config.device)
+    ctrlo.eval()
+    create_td_dataset(ctrlo, ctrlo_config)

@@ -116,6 +116,6 @@ def create_td_dataset(model, config):
             train_td_dict.clear()
             train_td_dict = get_empty_td_dataset(data_dct, len(dataset), device="cpu")
             start = index
-    train_td_dict[start:index].save(f"{config.save_path}/{config.data}_{index}.pt")
+    train_td_dict[start:index].save(f"{config.save_path}_{index}.pt")
 
 
